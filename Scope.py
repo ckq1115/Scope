@@ -8,6 +8,7 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 import csv
+from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, \
                              QHBoxLayout, QGridLayout, QComboBox, QPushButton, QLabel, QCheckBox, \
                              QScrollArea, QSpinBox, QDoubleSpinBox, QMessageBox, QLineEdit, QColorDialog, \
@@ -821,6 +822,13 @@ class MainWindow(QMainWindow):
         self.last_stat_bytes = 0
         self.current_fps = 0.0
         self.current_kbps = 0.0
+        self.configured_interval_ms = 1.0
+        self._updating_interval_display = False
+        self.dynamic_time_window_s = 3.0
+        self.dynamic_interval_ms = 1.0
+        self.dynamic_fps = 1000.0
+        self.dynamic_time_samples = deque()
+        self.dynamic_last_time_ms = None
         
         self.is_meas_active = False
         self.time_offset = 0.0
@@ -1046,22 +1054,31 @@ class MainWindow(QMainWindow):
         set_form = QGridLayout()
         set_form.addWidget(QLabel("X轴基准:"), 0, 0)
         self.combo_x_axis = QComboBox()
-        self.combo_x_axis.addItems(["真实时间戳", "理论点间隔"])
-        self.combo_x_axis.setCurrentIndex(1)
-        self.combo_x_axis.currentIndexChanged.connect(self.force_go_latest)
+        self.combo_x_axis.addItems(["动态平均间隔", "理论点间隔"])
+        self.combo_x_axis.setCurrentIndex(0)
+        self.combo_x_axis.currentIndexChanged.connect(self.on_x_axis_mode_changed)
         set_form.addWidget(self.combo_x_axis, 0, 1)
 
-        set_form.addWidget(QLabel("数据精度:"), 1, 0)
+        set_form.addWidget(QLabel("平均窗口(s):"), 1, 0)
+        self.spin_dynamic_time_window = QDoubleSpinBox()
+        self.spin_dynamic_time_window.setRange(0.2, 30.0)
+        self.spin_dynamic_time_window.setSingleStep(0.5)
+        self.spin_dynamic_time_window.setDecimals(1)
+        self.spin_dynamic_time_window.setValue(self.dynamic_time_window_s)
+        self.spin_dynamic_time_window.valueChanged.connect(self.on_dynamic_time_window_changed)
+        set_form.addWidget(self.spin_dynamic_time_window, 1, 1)
+
+        set_form.addWidget(QLabel("数据精度:"), 2, 0)
         self.spin_precision = QSpinBox()
         self.spin_precision.setRange(0, 20);
         self.spin_precision.setValue(5)
-        set_form.addWidget(self.spin_precision, 1, 1)
+        set_form.addWidget(self.spin_precision, 2, 1)
 
-        set_form.addWidget(QLabel("波形线宽:"), 2, 0)
+        set_form.addWidget(QLabel("波形线宽:"), 3, 0)
         self.spin_linewidth = QDoubleSpinBox()
         self.spin_linewidth.setRange(0.0, 10.0); self.spin_linewidth.setSingleStep(0.5); self.spin_linewidth.setDecimals(1); self.spin_linewidth.setValue(1.0)
         self.spin_linewidth.valueChanged.connect(lambda: self.update_curves_style(force=True))
-        set_form.addWidget(self.spin_linewidth, 2, 1)
+        set_form.addWidget(self.spin_linewidth, 3, 1)
         tab_settings_layout.addLayout(set_form)
 
         tab_settings_layout.addWidget(QLabel("离线数据:"))
@@ -1309,6 +1326,7 @@ class MainWindow(QMainWindow):
         spin_interval.setSingleStep(1.0)
         spin_interval.setDecimals(3)
         spin_interval.setFixedWidth(120)
+        spin_interval.valueChanged.connect(self.on_interval_changed)
 
         spin_visible_points = QSpinBox()
         spin_visible_points.setRange(10, 500000)
@@ -1323,7 +1341,7 @@ class MainWindow(QMainWindow):
         timeline_layout.addWidget(QLabel("显示点数:"))
         timeline_layout.addWidget(spin_visible_points)
 
-        lbl_buffer_status = QLabel(" 缓存: 0 / 100000 | 帧率: 0 Hz | 速率: 0.0 KB/s")
+        lbl_buffer_status = QLabel(" 缓存: 0 / 100000 | 帧率: 0 Hz | 间隔: 1.000 ms | 速率: 0.0 KB/s")
         lbl_buffer_status.setStyleSheet("color: #aaaaaa; font-family: 'Consolas'; font-size: 11px;")
         lbl_buffer_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         timeline_layout.addWidget(lbl_buffer_status, stretch=1)
@@ -1464,7 +1482,7 @@ class MainWindow(QMainWindow):
         gl_view.addItem(y_axis)
         gl_view.addItem(z_axis)
 
-        # 参考网格（仅 XZ 水平面，间距 1.0 清爽不杂乱）
+        # 参考网格（XY 水平面，+Z 向上）
         grid = gl.GLGridItem(color=(180, 180, 195, 160))
         grid.setSize(4, 4)
         grid.setSpacing(0.5, 0.5)
@@ -1488,36 +1506,35 @@ class MainWindow(QMainWindow):
         btn_reset_view.clicked.connect(
             lambda: gl_view.setCameraPosition(distance=5, elevation=25, azimuth=45))
 
-        # ---- 3D 长方体 (1.0 x 0.6 x 1.5) ----
-        # 顶点
-        hw, hh, hd = 0.5, 0.3, 0.75  # 半尺寸
+        # ---- 3D 长方体：右手系 FLU，+X 前，+Y 左，+Z 上 ----
+        hx, hy, hz = 0.75, 0.3, 0.5  # 半尺寸：长/宽/高
         verts = np.array([
-            [-hw, -hh, -hd], [ hw, -hh, -hd], [ hw,  hh, -hd], [-hw,  hh, -hd],  # 前 (-Z)
-            [-hw, -hh,  hd], [ hw, -hh,  hd], [ hw,  hh,  hd], [-hw,  hh,  hd],  # 后 (+Z)
+            [-hx, -hy, -hz], [ hx, -hy, -hz], [ hx,  hy, -hz], [-hx,  hy, -hz],  # 底 (-Z)
+            [-hx, -hy,  hz], [ hx, -hy,  hz], [ hx,  hy,  hz], [-hx,  hy,  hz],  # 顶 (+Z)
         ], dtype=np.float32)
         # 三角面片 (每面2个三角形，共12个面)
         faces = np.array([
-            # -Z面(前) 暗蓝
-            [0,1,2], [0,2,3],
-            # +Z面(后) 亮蓝
-            [4,6,5], [4,7,6],
-            # -X面(左) 暗红
-            [0,4,5], [0,5,1],
-            # +X面(右) 亮红
-            [2,6,7], [2,7,3],
-            # -Y面(底) 暗绿
-            [0,3,7], [0,7,4],
-            # +Y面(顶) 亮绿
-            [1,5,6], [1,6,2],
+            # -Z 面（底）
+            [0, 2, 1], [0, 3, 2],
+            # +Z 面（顶）
+            [4, 5, 6], [4, 6, 7],
+            # -X 面（后）
+            [0, 4, 7], [0, 7, 3],
+            # +X 面（前）
+            [1, 2, 6], [1, 6, 5],
+            # -Y 面（右）
+            [0, 1, 5], [0, 5, 4],
+            # +Y 面（左）
+            [3, 7, 6], [3, 6, 2],
         ], dtype=np.int32)
         # 面颜色
         face_colors = np.array([
-            [0.2, 0.3, 0.8, 0.85], [0.2, 0.3, 0.8, 0.85],   # -Z 蓝色
-            [0.4, 0.5, 1.0, 0.85], [0.4, 0.5, 1.0, 0.85],   # +Z 亮蓝
-            [0.8, 0.2, 0.2, 0.85], [0.8, 0.2, 0.2, 0.85],   # -X 红色
-            [1.0, 0.3, 0.3, 0.85], [1.0, 0.3, 0.3, 0.85],   # +X 亮红
-            [0.2, 0.7, 0.2, 0.85], [0.2, 0.7, 0.2, 0.85],   # -Y 绿色
-            [0.3, 1.0, 0.3, 0.85], [0.3, 1.0, 0.3, 0.85],   # +Y 亮绿
+            [0.15, 0.25, 0.65, 0.85], [0.15, 0.25, 0.65, 0.85],  # -Z 底：暗蓝
+            [0.35, 0.55, 1.00, 0.85], [0.35, 0.55, 1.00, 0.85],  # +Z 上：亮蓝
+            [0.55, 0.15, 0.15, 0.85], [0.55, 0.15, 0.15, 0.85],  # -X 后：暗红
+            [1.00, 0.25, 0.25, 0.85], [1.00, 0.25, 0.25, 0.85],  # +X 前：亮红
+            [0.15, 0.55, 0.15, 0.85], [0.15, 0.55, 0.15, 0.85],  # -Y 右：暗绿
+            [0.35, 1.00, 0.35, 0.85], [0.35, 1.00, 0.35, 0.85],  # +Y 左：亮绿
         ], dtype=np.float32)
 
         md = gl.MeshData(vertexes=verts, faces=faces, faceColors=face_colors)
@@ -1533,6 +1550,11 @@ class MainWindow(QMainWindow):
         container.gl_view = gl_view
         container.box_mesh = box_mesh
         container.curves = []  # 兼容 update 循环
+        container.imu_channel_indices = [0, 1, 2, 3]
+        for i, sel in enumerate(ch_selectors):
+            sel.currentIndexChanged.connect(
+                lambda idx, selector_idx=i, w=container: self._on_imu_channel_changed(w, selector_idx, idx)
+            )
 
         # 初始化通道列表
         self._refresh_imu_channels(widget=container)
@@ -1548,6 +1570,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_imu_channels(self, widget):
         """刷新 IMU 窗口的通道选择器列表"""
+        if not hasattr(widget, 'imu_channel_indices'):
+            widget.imu_channel_indices = [sel.currentIndex() for sel in widget.ch_selectors]
+        while len(widget.imu_channel_indices) < len(widget.ch_selectors):
+            widget.imu_channel_indices.append(len(widget.imu_channel_indices))
+
         ch_names = []
         for i in range(len(self.data_history)):
             name = (self.channel_widgets[i]["name_edit"].text().strip()
@@ -1555,16 +1582,27 @@ class MainWindow(QMainWindow):
             ch_names.append(f"CH{i+1}:{name}")
         if not ch_names:
             ch_names = ["(无通道)"]
-        for sel in widget.ch_selectors:
+        for selector_idx, sel in enumerate(widget.ch_selectors):
+            saved_idx = widget.imu_channel_indices[selector_idx]
             current = sel.currentText()
             sel.blockSignals(True)
             sel.clear()
             sel.addItems(ch_names)
-            if current in ch_names:
+            if 0 <= saved_idx < len(ch_names):
+                sel.setCurrentIndex(saved_idx)
+            elif current in ch_names:
                 sel.setCurrentText(current)
+                widget.imu_channel_indices[selector_idx] = sel.currentIndex()
             sel.blockSignals(False)
         # 更新模式显示（可能通道数变了）
         widget.mode_combo.currentIndexChanged.emit(widget.mode_combo.currentIndex())
+
+    def _on_imu_channel_changed(self, widget, selector_idx, channel_idx):
+        if not hasattr(widget, 'imu_channel_indices'):
+            widget.imu_channel_indices = [0, 1, 2, 3]
+        while len(widget.imu_channel_indices) <= selector_idx:
+            widget.imu_channel_indices.append(0)
+        widget.imu_channel_indices[selector_idx] = int(channel_idx)
 
     def add_window(self):
         """根据下拉框选择添加新窗口"""
@@ -1658,6 +1696,7 @@ class MainWindow(QMainWindow):
             else:
                 return
 
+            self._reset_dynamic_time_axis(keep_time=True)
             thread.data_received.connect(self.handle_batch_matrix)
             thread.connection_error.connect(self.handle_connection_exception)
             thread.start()
@@ -1707,6 +1746,48 @@ class MainWindow(QMainWindow):
         self.current_kbps = float(self.total_bytes_received - self.last_stat_bytes) / 1024.0
         self.last_stat_frames = self.total_frames_received
         self.last_stat_bytes = self.total_bytes_received
+
+    def _reset_dynamic_time_axis(self, keep_time=True):
+        """重置动态平均间隔估计器，不清除已有波形数据。"""
+        self.dynamic_time_samples.clear()
+        fallback_interval = self.configured_interval_ms
+        self.dynamic_interval_ms = max(0.001, float(fallback_interval))
+        self.dynamic_fps = 1000.0 / self.dynamic_interval_ms
+        if keep_time and self.time_history.total_count > 0:
+            last_time = self.time_history.get_val_at_abs(self.time_history.total_count - 1)
+            self.dynamic_last_time_ms = float(last_time) if last_time is not None else 0.0
+        else:
+            self.dynamic_last_time_ms = 0.0
+
+    def _make_dynamic_time_array(self, frames):
+        """按最近 N 秒平均 FPS 生成等间隔时间轴，避免批量接收造成真实时间戳抖动。"""
+        if frames <= 0:
+            return np.array([], dtype=np.float64)
+
+        now_ms = time.perf_counter() * 1000.0
+        window_ms = max(0.2, float(self.dynamic_time_window_s)) * 1000.0
+        self.dynamic_time_samples.append((now_ms, self.total_frames_received))
+        while len(self.dynamic_time_samples) > 2 and now_ms - self.dynamic_time_samples[0][0] > window_ms:
+            self.dynamic_time_samples.popleft()
+
+        if len(self.dynamic_time_samples) >= 2:
+            first_t, first_frames = self.dynamic_time_samples[0]
+            last_t, last_frames = self.dynamic_time_samples[-1]
+            elapsed_ms = last_t - first_t
+            frame_delta = last_frames - first_frames
+            if elapsed_ms > 1.0 and frame_delta > 0:
+                self.dynamic_fps = frame_delta * 1000.0 / elapsed_ms
+                self.dynamic_interval_ms = max(0.001, 1000.0 / self.dynamic_fps)
+
+        if self.dynamic_last_time_ms is None:
+            self._reset_dynamic_time_axis(keep_time=True)
+
+        step = self.dynamic_interval_ms
+        t_array = self.dynamic_last_time_ms + step * np.arange(1, frames + 1, dtype=np.float64)
+        self.dynamic_last_time_ms = float(t_array[-1])
+        if hasattr(self, 'combo_x_axis') and self.combo_x_axis.currentIndex() == 0:
+            self._sync_interval_spinbox_to_mode()
+        return t_array
 
     def send_tx_data(self):
         if not self.comm_thread or not self.comm_thread.running:
@@ -1824,6 +1905,7 @@ class MainWindow(QMainWindow):
             else:
                 self.time_offset = 0.0
             
+            self._reset_dynamic_time_axis(keep_time=True)
             self.comm_thread = SerialThread(port, baud)
             self.comm_thread.data_received.connect(self.handle_batch_matrix)
             self.comm_thread.serial_error.connect(self.handle_serial_exception)
@@ -2138,6 +2220,30 @@ class MainWindow(QMainWindow):
         for buf in self.data_history: buf.resize_buffer(value)
         self.force_go_latest()
 
+    def on_interval_changed(self, value):
+        if self._updating_interval_display:
+            return
+        self.configured_interval_ms = float(value)
+        self.dynamic_interval_ms = max(0.001, self.dynamic_interval_ms)
+
+    def on_x_axis_mode_changed(self, _idx):
+        self._sync_interval_spinbox_to_mode()
+        self.force_go_latest()
+
+    def _sync_interval_spinbox_to_mode(self):
+        if not hasattr(self, 'spin_interval'):
+            return
+        use_dynamic = (self.combo_x_axis.currentIndex() == 0)
+        display_value = self.dynamic_interval_ms if use_dynamic else self.configured_interval_ms
+        self._updating_interval_display = True
+        self.spin_interval.setEnabled(not use_dynamic)
+        self.spin_interval.setValue(max(0.001, float(display_value)))
+        self._updating_interval_display = False
+
+    def on_dynamic_time_window_changed(self, value):
+        self.dynamic_time_window_s = float(value)
+        self.dynamic_time_samples.clear()
+
     def on_visible_points_changed(self, value):
         self.visible_points = value
         if not self.auto_follow_x:
@@ -2326,7 +2432,7 @@ class MainWindow(QMainWindow):
         if len(self.data_history) != old_num_channels:
             self._refresh_all_imu_channels()
 
-        self.time_history.extend(t_array + self.time_offset)
+        self.time_history.extend(self._make_dynamic_time_array(frames))
         for i in range(num_signals): 
             self.data_history[i].extend(matrix[i])
 
@@ -2523,11 +2629,16 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _quat_to_matrix(w, x, y, z):
-        """四元数 → 3x3 旋转矩阵"""
+        """四元数 → FLU 右手系旋转矩阵。
+
+        坐标定义：+X 前，+Y 左，+Z 上。与欧拉角模式保持一致：
+        roll/pitch 输入反向映射，等价于四元数 x/y 分量取反。
+        """
         n = np.sqrt(w*w + x*x + y*y + z*z)
         if n < 1e-12:
             return np.eye(3, dtype=np.float32)
         w, x, y, z = w/n, x/n, y/n, z/n
+        x, y = -x, -y
         return np.array([
             [1-2*y*y-2*z*z, 2*x*y-2*w*z, 2*x*z+2*w*y],
             [2*x*y+2*w*z, 1-2*x*x-2*z*z, 2*y*z-2*w*x],
@@ -2536,12 +2647,16 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _euler_to_matrix(roll, pitch, yaw):
-        """欧拉角 ZYX (yaw-pitch-roll, 度) → 3x3 旋转矩阵"""
-        r, p, y = np.radians(roll), np.radians(pitch), np.radians(yaw)
+        """欧拉角 ZYX (yaw-pitch-roll, 度) → FLU 右手系旋转矩阵。
+
+        坐标定义：+X 前，+Y 左，+Z 上。输入角按当前 IMU 输出习惯映射：
+        roll/pitch 正值分别等价于绕 -X/-Y 旋转。
+        """
+        r, p, y = np.radians(-roll), np.radians(-pitch), np.radians(yaw)
         cr, sr = np.cos(r), np.sin(r)
         cp, sp = np.cos(p), np.sin(p)
         cy, sy = np.cos(y), np.sin(y)
-        # R = Rz(yaw) * Ry(pitch) * Rx(roll)
+        # R = Rz(yaw) * Ry(-pitch_input) * Rx(-roll_input)
         return np.array([
             [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
             [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
@@ -2588,7 +2703,14 @@ class MainWindow(QMainWindow):
         else:
             current_len = live_len
 
-        self.lbl_buffer_status.setText(f"缓存: {min(live_len, self.max_memory_points)}/{self.max_memory_points} | 帧率: {self.current_fps:.0f} Hz | 速率: {self.current_kbps:.1f} KB/s")
+        if self.combo_x_axis.currentIndex() == 0:
+            x_axis_info = f"动态: {self.dynamic_fps:.1f} Hz / {self.dynamic_interval_ms:.3f} ms"
+        else:
+            x_axis_info = f"间隔: {self.configured_interval_ms:.3f} ms"
+        self.lbl_buffer_status.setText(
+            f"缓存: {min(live_len, self.max_memory_points)}/{self.max_memory_points} | "
+            f"帧率: {self.current_fps:.0f} Hz | {x_axis_info} | 速率: {self.current_kbps:.1f} KB/s"
+        )
 
         self.render_frame_counter += 1
         is_text_frame = (self.render_frame_counter % 2 == 0)
@@ -2863,6 +2985,7 @@ class MainWindow(QMainWindow):
             if i < len(self.fft_curves) and self.fft_curves[i] is not None:
                 self.fft_curves[i].setData([], [])
         self.time_history.clear()
+        self._reset_dynamic_time_axis(keep_time=False)
         for lbl in self.hud_labels: 
             lbl.hide()
         self.time_hud_label.hide()
@@ -2945,6 +3068,7 @@ class MainWindow(QMainWindow):
                     self.create_channel_ui(len(self.data_history) - 1)
                 
                 self.time_history.extend(time_array)
+                self._reset_dynamic_time_axis(keep_time=True)
                 for i in range(num_channels):
                     self.channel_widgets[i]["name_edit"].setText(headers[i+1])
                     self.data_history[i].resize_buffer(self.max_memory_points)
@@ -2970,6 +3094,8 @@ class MainWindow(QMainWindow):
             # 加载通用设置
             if self.settings.contains("x_axis_mode"):
                 self.combo_x_axis.setCurrentIndex(int(self.settings.value("x_axis_mode")))
+            if self.settings.contains("dynamic_time_window"):
+                self.spin_dynamic_time_window.setValue(float(self.settings.value("dynamic_time_window")))
             if self.settings.contains("draw_mode"):
                 self.combo_draw_mode.setCurrentIndex(int(self.settings.value("draw_mode")))
             if self.settings.contains("baudrate"):
@@ -2979,7 +3105,13 @@ class MainWindow(QMainWindow):
             if self.settings.contains("linewidth"):
                 self.spin_linewidth.setValue(float(self.settings.value("linewidth")))
             if self.settings.contains("interval"):
-                self.spin_interval.setValue(float(self.settings.value("interval")))
+                self.configured_interval_ms = float(self.settings.value("interval"))
+                self._updating_interval_display = True
+                self.spin_interval.setValue(self.configured_interval_ms)
+                self._updating_interval_display = False
+            else:
+                self.configured_interval_ms = self.spin_interval.value()
+            self._sync_interval_spinbox_to_mode()
             if self.settings.contains("max_cache"):
                 self.spin_max_cache.setValue(int(self.settings.value("max_cache")))
                 self.max_memory_points = int(self.settings.value("max_cache"))
@@ -3068,9 +3200,10 @@ class MainWindow(QMainWindow):
                         if win_type == 'imu' and 'imu_mode' in win_data:
                             widget.mode_combo.setCurrentIndex(win_data['imu_mode'])
                             saved_ch = win_data.get('imu_channels', [])
-                            for i, idx in enumerate(saved_ch):
-                                if i < len(widget.ch_selectors) and idx < widget.ch_selectors[i].count():
-                                    widget.ch_selectors[i].setCurrentIndex(idx)
+                            widget.imu_channel_indices = list(saved_ch[:len(widget.ch_selectors)])
+                            while len(widget.imu_channel_indices) < len(widget.ch_selectors):
+                                widget.imu_channel_indices.append(len(widget.imu_channel_indices))
+                            self._refresh_imu_channels(widget=widget)
 
                         # 如果是频域窗口且还没有设置主频域，则设置
                         if win_type == 'fft' and self.fft_plot is None:
@@ -3139,11 +3272,12 @@ class MainWindow(QMainWindow):
 
         # 保存通用设置
         self.settings.setValue("x_axis_mode", self.combo_x_axis.currentIndex())
+        self.settings.setValue("dynamic_time_window", self.spin_dynamic_time_window.value())
         self.settings.setValue("draw_mode", self.combo_draw_mode.currentIndex())
         self.settings.setValue("baudrate", self.baud_combo.currentText())
         self.settings.setValue("precision", self.spin_precision.value())
         self.settings.setValue("linewidth", self.spin_linewidth.value())
-        self.settings.setValue("interval", self.spin_interval.value())
+        self.settings.setValue("interval", self.configured_interval_ms)
         self.settings.setValue("max_cache", self.spin_max_cache.value())
         self.settings.setValue("visible_points", self.spin_visible_points.value())
         self.settings.setValue("geometry", self.saveGeometry())
@@ -3181,7 +3315,9 @@ class MainWindow(QMainWindow):
                     if w and hasattr(w, 'mode_combo'):
                         win_data['imu_mode'] = w.mode_combo.currentIndex()
                         win_data['imu_channels'] = [
-                            sel.currentIndex() for sel in w.ch_selectors
+                            int(w.imu_channel_indices[i]) if hasattr(w, 'imu_channel_indices') and i < len(w.imu_channel_indices)
+                            else sel.currentIndex()
+                            for i, sel in enumerate(w.ch_selectors)
                         ]
                 window_list.append(win_data)
         self.settings.setValue("window_list", window_list)
