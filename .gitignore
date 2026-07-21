@@ -1,6 +1,8 @@
 config.ini
+.__pycache__/
 .settings/
 .idea/
 .vscode/
 .clangd/
-.ideagit rm -r --cached .
+.idea/
+git rm -r --cached .
