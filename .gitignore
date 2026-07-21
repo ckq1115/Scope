@@ -1,0 +1,7 @@
+.config.ini
+.settings/
+.idea/
+.vscode/
+.clangd/
+.ideagit rm -r --cached .
+mx.scratch

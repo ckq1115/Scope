@@ -1,0 +1,37 @@
+# 删除旧的残留编译文件、打包配置和虚拟环境
+Remove-Item -Recurse -Force *.build, *.dist, build_out, venv_pack -ErrorAction SilentlyContinue
+
+# 1. 创建全新的、不带任何第三方污染的虚拟环境
+python -m venv venv_pack
+
+# 2. 解锁当前窗口的脚本执行限制
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+
+# 3. 激活虚拟环境
+.\venv_pack\Scripts\activate
+
+# 升级基础安装工具
+python -m pip install --upgrade pip
+
+
+pyinstaller --noconsole --onefile --clean --collect-all pyqtgraph --name Horizon_wave_V2 --icon=favicon.ico wave.py
+# 精准安装核心依赖，将 pyinstaller 替换为 nuitka
+# (新增 zstandard：Nuitka 官方强烈推荐，可大幅加快打包时的缓存处理速度)
+pip install PyQt6 pyqtgraph pyserial nuitka zstandard
+
+# 强制重新覆盖安装 numpy，确保拉取纯净、不带 Intel MKL 的标准官方 OpenBLAS 版本
+pip install --force-reinstall numpy
+
+# 4. 使用 Nuitka 进行 C++ 级别深度编译打包
+python -m nuitka --standalone --windows-console-mode=disable `
+--enable-plugin=pyqt6 `
+--include-package=OpenGL `
+--nofollow-import-to=PyQt6.QtWebEngineCore `
+--nofollow-import-to=PyQt6.QtWebEngineWidgets `
+--nofollow-import-to=PyQt6.QtMultimedia `
+--nofollow-import-to=PyQt6.QtQml `
+--nofollow-import-to=PyQt6.QtQuick `
+--nofollow-import-to=PyQt6.QtSql `
+--nofollow-import-to=PyQt6.Qt3DCore `
+--output-dir=build_out `
+Horizon_wave_uart.py
