@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, \
                              QSplitter, QFileDialog, QTabWidget, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, \
                              QSizePolicy)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QPointF, QRectF, QSettings, QByteArray
-from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QTransform, QPolygonF, QIcon, QMatrix4x4, QVector3D
+from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QTransform, QPolygonF, QIcon, QPixmap, QMatrix4x4, QVector3D
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6.QtWidgets import QMdiArea, QMdiSubWindow
@@ -74,6 +74,116 @@ DARK_STYLE += """
     }
 """
 
+class MdiTitleBar(QWidget):
+    def __init__(self, sub_window):
+        super().__init__(sub_window)
+        self.sub_window = sub_window
+        self._drag_start_global = None
+        self._drag_start_pos = None
+        self.setObjectName("mdiTitleBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(26)
+        self.setStyleSheet("""
+            QWidget#mdiTitleBar {
+                background-color: #242424;
+                color: #dddddd;
+                font-family: 'Microsoft YaHei', Helvetica;
+                font-size: 12px;
+            }
+            QLabel#mdiTitleLabel {
+                background: transparent;
+                font-weight: bold;
+                padding-left: 82px;
+                padding-right: 82px;
+            }
+            QPushButton#titleButton,
+            QPushButton#closeButton {
+                background-color: transparent;
+                border: none;
+                color: #cccccc;
+                padding: 0;
+                border-radius: 0;
+                font-size: 12px;
+                font-weight: normal;
+            }
+            QPushButton#titleButton:hover,
+            QPushButton#closeButton:hover {
+                background-color: #3a3a3a;
+                color: #ffffff;
+            }
+            QPushButton#closeButton:hover {
+                background-color: #c42b1c;
+                color: #ffffff;
+            }
+        """)
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 4, 0)
+        layout.setSpacing(0)
+        self.title_label = QLabel(sub_window.windowTitle())
+        self.title_label.setObjectName("mdiTitleLabel")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(self.title_label, 0, 0)
+
+        self.btn_min = QPushButton("─")
+        self.btn_max = QPushButton("□")
+        self.btn_close = QPushButton("×")
+        self.btn_close.setObjectName("closeButton")
+        buttons = QWidget()
+        buttons.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        buttons_layout = QHBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 2, 0, 2)
+        buttons_layout.setSpacing(2)
+        for btn in (self.btn_min, self.btn_max, self.btn_close):
+            if btn is not self.btn_close:
+                btn.setObjectName("titleButton")
+            btn.setFixedSize(24, 22)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            buttons_layout.addWidget(btn)
+        layout.addWidget(buttons, 0, 0, alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.btn_min.clicked.connect(sub_window.showMinimized)
+        self.btn_max.clicked.connect(self.toggle_maximized)
+        self.btn_close.clicked.connect(sub_window.close)
+
+    def set_title(self, title):
+        self.title_label.setText(title)
+
+    def toggle_maximized(self):
+        if self.sub_window.isMaximized():
+            self.sub_window.showNormal()
+        else:
+            self.sub_window.showMaximized()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.sub_window.isMaximized():
+            self._drag_start_global = event.globalPosition().toPoint()
+            self._drag_start_pos = self.sub_window.pos()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start_global is not None and self._drag_start_pos is not None:
+            delta = event.globalPosition().toPoint() - self._drag_start_global
+            self.sub_window.move(self._drag_start_pos + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_global = None
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
+
 class SnapMdiSubWindow(QMdiSubWindow):
     _all_windows = []
     _parent_resizing = False       # 类级别标志：主窗口正在缩放时，所有子窗口跳过约束
@@ -92,7 +202,41 @@ class SnapMdiSubWindow(QMdiSubWindow):
         self._updating_geometry = False    # 防止递归
         self._frac_geometry = None         # (x_frac, y_frac, w_frac, h_frac) 比例坐标
         self.setMinimumSize(50, 50)
+        transparent_icon = QPixmap(1, 1)
+        transparent_icon.fill(Qt.GlobalColor.transparent)
+        self.setWindowIcon(QIcon(transparent_icon))
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        self._title_bar = MdiTitleBar(self)
+        self._content_widget = None
+        self._wrapper_widget = None
         SnapMdiSubWindow._all_windows.append(self)
+
+    def setWindowTitle(self, title):
+        super().setWindowTitle(title)
+        if hasattr(self, '_title_bar'):
+            self._title_bar.set_title(title)
+
+    def setWidget(self, widget):
+        self._content_widget = widget
+        wrapper = QWidget()
+        wrapper.setObjectName("mdiWindowFrame")
+        wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        wrapper.setStyleSheet("""
+            QWidget#mdiWindowFrame {
+                background-color: #1e1e1e;
+                border: 1px solid #3d3d3d;
+            }
+        """)
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(1, 1, 1, 1)
+        wrapper_layout.setSpacing(0)
+        wrapper_layout.addWidget(self._title_bar)
+        wrapper_layout.addWidget(widget, stretch=1)
+        self._wrapper_widget = wrapper
+        super().setWidget(wrapper)
+
+    def widget(self):
+        return self._content_widget if self._content_widget is not None else super().widget()
 
     def _get_parent_rect(self):
         """获取父窗口（QMdiArea）的可见视口矩形。
@@ -1506,6 +1650,24 @@ class MainWindow(QMainWindow):
         btn_reset_view.clicked.connect(
             lambda: gl_view.setCameraPosition(distance=5, elevation=25, azimuth=45))
 
+        angle_label = QLabel(gl_view)
+        angle_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        angle_label.setStyleSheet("""
+            QLabel {
+                background-color: rgba(20, 20, 20, 210);
+                color: #f0f0f0;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-family: 'Consolas';
+                font-size: 11px;
+            }
+        """)
+        angle_label.move(10, 44)
+        angle_label.setText("Roll:  +0.00°\nPitch: +0.00°\nYaw:   +0.00°")
+        angle_label.adjustSize()
+        angle_label.show()
+
         # ---- 3D 长方体：右手系 FLU，+X 前，+Y 左，+Z 上 ----
         hx, hy, hz = 0.75, 0.3, 0.5  # 半尺寸：长/宽/高
         verts = np.array([
@@ -1542,6 +1704,45 @@ class MainWindow(QMainWindow):
                                   drawEdges=True, edgeColor=(0.5, 0.5, 0.5, 0.5))
         gl_view.addItem(box_mesh)
 
+        def axis_meshdata(axis, start, length, radius):
+            md_axis = gl.MeshData.cylinder(rows=1, cols=28, radius=radius, length=length, offset=True)
+            local = md_axis.vertexes()
+            verts_axis = np.empty_like(local)
+            if axis == 'x':
+                verts_axis[:, 0] = start + local[:, 2]
+                verts_axis[:, 1] = local[:, 0]
+                verts_axis[:, 2] = local[:, 1]
+            elif axis == 'y':
+                verts_axis[:, 0] = local[:, 0]
+                verts_axis[:, 1] = start + local[:, 2]
+                verts_axis[:, 2] = local[:, 1]
+            else:
+                verts_axis[:, 0] = local[:, 0]
+                verts_axis[:, 1] = local[:, 1]
+                verts_axis[:, 2] = start + local[:, 2]
+            return gl.MeshData(vertexes=verts_axis, faces=md_axis.faces())
+
+        def make_axis_arrow(axis):
+            specs = {
+                'x': (hx + 0.05, 0.32, 0.22, 0.035, 0.11, (1.0, 0.12, 0.10, 1.0)),
+                'y': (hy + 0.05, 0.28, 0.20, 0.030, 0.095, (0.15, 1.0, 0.15, 1.0)),
+                'z': (hz + 0.05, 0.30, 0.21, 0.032, 0.10, (0.25, 0.55, 1.0, 1.0)),
+            }
+            start, shaft_len, head_len, shaft_r, head_r, color = specs[axis]
+            shaft = gl.GLMeshItem(
+                meshdata=axis_meshdata(axis, start, shaft_len, [shaft_r, shaft_r]),
+                smooth=True, shader='shaded', color=color, drawEdges=False)
+            head = gl.GLMeshItem(
+                meshdata=axis_meshdata(axis, start + shaft_len, head_len, [head_r, 0.0]),
+                smooth=True, shader='shaded', color=color, drawEdges=False)
+            return [shaft, head]
+
+        body_axis_items = []
+        for axis_name in ('x', 'y', 'z'):
+            body_axis_items.extend(make_axis_arrow(axis_name))
+        for item in body_axis_items:
+            gl_view.addItem(item)
+
         layout.addWidget(gl_view, stretch=1)
 
         # 挂在 widget 上的属性
@@ -1549,6 +1750,8 @@ class MainWindow(QMainWindow):
         container.ch_selectors = ch_selectors
         container.gl_view = gl_view
         container.box_mesh = box_mesh
+        container.body_axis_items = body_axis_items
+        container.imu_angle_label = angle_label
         container.curves = []  # 兼容 update 循环
         container.imu_channel_indices = [0, 1, 2, 3]
         for i, sel in enumerate(ch_selectors):
@@ -2663,6 +2866,19 @@ class MainWindow(QMainWindow):
             [-sp,   cp*sr,            cp*cr],
         ], dtype=np.float32)
 
+    @staticmethod
+    def _matrix_to_display_euler(R):
+        """从当前显示矩阵反算用户视角的 roll/pitch/yaw（度）。"""
+        p = np.arcsin(np.clip(-R[2, 0], -1.0, 1.0))
+        cp = np.cos(p)
+        if abs(cp) > 1e-6:
+            r = np.arctan2(R[2, 1], R[2, 2])
+            y = np.arctan2(R[1, 0], R[0, 0])
+        else:
+            r = 0.0
+            y = np.arctan2(-R[0, 1], R[1, 1])
+        return -np.degrees(r), -np.degrees(p), np.degrees(y)
+
     def update_imu_window(self, widget):
         """更新单个 IMU 窗口的姿态"""
         if not self.data_history:
@@ -2681,6 +2897,8 @@ class MainWindow(QMainWindow):
             yaw = self._get_channel_value(sel[2].currentIndex() if sel[2].count() > 0 else -1)
             R = self._euler_to_matrix(roll, pitch, yaw)
 
+        disp_roll, disp_pitch, disp_yaw = self._matrix_to_display_euler(R)
+
         # 构建 4x4 齐次变换矩阵
         mat = QMatrix4x4(
             R[0,0], R[0,1], R[0,2], 0,
@@ -2690,6 +2908,17 @@ class MainWindow(QMainWindow):
         )
         widget.box_mesh.resetTransform()
         widget.box_mesh.setTransform(mat)
+        for item in getattr(widget, 'body_axis_items', []):
+            item.resetTransform()
+            item.setTransform(mat)
+        if hasattr(widget, 'imu_angle_label'):
+            widget.imu_angle_label.setText(
+                f"Roll:  {disp_roll:+7.2f}°\n"
+                f"Pitch: {disp_pitch:+7.2f}°\n"
+                f"Yaw:   {disp_yaw:+7.2f}°\n"
+                f"+X 前  +Y 左  +Z 上"
+            )
+            widget.imu_angle_label.adjustSize()
 
     def update_plot_display(self):
         if not self.data_history:
