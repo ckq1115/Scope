@@ -762,7 +762,8 @@ class MainWindow(QMainWindow):
         
         set_form.addWidget(QLabel("数据精度:"), 1, 0)
         self.spin_precision = QSpinBox()
-        self.spin_precision.setRange(0, 20); self.spin_precision.setValue(5)
+        self.spin_precision.setRange(0, 20); 
+        self.spin_precision.setValue(5)
         set_form.addWidget(self.spin_precision, 1, 1)
         
         set_form.addWidget(QLabel("波形线宽:"), 2, 0)
