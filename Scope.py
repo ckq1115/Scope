@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 import time
 import queue
 import socket
@@ -13,8 +14,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, \
                              QSplitter, QFileDialog, QTabWidget, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, \
                              QSizePolicy)
 from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt, QPoint, QPointF, QRectF, QSettings, QByteArray
-from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QTransform, QPolygonF, QIcon
+from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QTransform, QPolygonF, QIcon, QMatrix4x4, QVector3D
 import pyqtgraph as pg
+import pyqtgraph.opengl as gl
 from PyQt6.QtWidgets import QMdiArea, QMdiSubWindow
 
 if getattr(sys, 'frozen', False):
@@ -771,6 +773,9 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
         self.setStyleSheet(DARK_STYLE)
         self.last_crosshair_idx = -1
+        # 首次启动时从模板复制默认配置
+        if not os.path.exists("config.ini") and os.path.exists("config.default.ini"):
+            shutil.copy("config.default.ini", "config.ini")
         self.settings = QSettings("config.ini", QSettings.Format.IniFormat)
         self.setWindowIcon(QIcon("favicon.ico"))
         self._pending_splitter_state = None   # showEvent 中用于恢复侧栏宽度
@@ -848,12 +853,13 @@ class MainWindow(QMainWindow):
         self.main_time_sub = None
         self.main_fft_sub = None
         # 窗口管理
-        self.window_counter = {'time': 0, 'fft': 0}
+        self.window_counter = {'time': 0, 'fft': 0, 'imu': 0}
         self.window_factories = {
             '时域波形': self.create_time_widget,
             '频域频谱': self.create_fft_widget,
+            'IMU姿态': self.create_imu_widget,
         }
-        self.window_type_map = {'时域波形': 'time', '频域频谱': 'fft'}
+        self.window_type_map = {'时域波形': 'time', '频域频谱': 'fft', 'IMU姿态': 'imu'}
 
     def init_ui(self, left_axis, right_axis, bottom_axis):
         main_widget = QWidget()
@@ -1029,7 +1035,7 @@ class MainWindow(QMainWindow):
         add_window_layout = QHBoxLayout(add_window_group)
         add_window_layout.setContentsMargins(0, 0, 0, 0)
         self.combo_add_window = QComboBox()
-        self.combo_add_window.addItems(['时域波形', '频域频谱'])
+        self.combo_add_window.addItems(['时域波形', '频域频谱', 'IMU姿态'])
         self.btn_add_window = QPushButton("添加窗口")
         self.btn_add_window.clicked.connect(self.add_window)
         add_window_layout.addWidget(QLabel("添加窗口:"))
@@ -1387,7 +1393,179 @@ class MainWindow(QMainWindow):
         container.fft_curves = []
         container.fft_plot = fft_plot
         return container
-    
+
+    def create_imu_widget(self):
+        """创建 IMU 姿态 3D 可视化模块"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # ---- 控制栏 ----
+        ctrl = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl)
+        ctrl_layout.setContentsMargins(4, 2, 4, 2)
+
+        mode_label = QLabel("模式:")
+        mode_combo = QComboBox()
+        mode_combo.addItems(["四元数 (w,x,y,z)", "欧拉角 ZYX (deg)"])
+
+        ctrl_layout.addWidget(mode_label)
+        ctrl_layout.addWidget(mode_combo)
+        ctrl_layout.addStretch()
+
+        # 标签容器：四元数用4个，欧拉角用3个
+        quat_labels = ["w:", "x:", "y:", "z:"]
+        euler_labels = ["Roll:", "Pitch:", "Yaw:"]
+        ch_selectors = []
+        lbl_widgets = []
+
+        for i in range(4):
+            lbl = QLabel(quat_labels[i])
+            ctrl_layout.addWidget(lbl)
+            lbl_widgets.append(lbl)
+        for i in range(4):
+            sel = QComboBox()
+            sel.setMinimumWidth(60)
+            ctrl_layout.addWidget(sel)
+            ch_selectors.append(sel)
+
+        def on_mode_changed(idx):
+            is_quat = (idx == 0)
+            visible_count = 4 if is_quat else 3
+            labels = quat_labels if is_quat else euler_labels
+            for i in range(4):
+                lbl_widgets[i].setVisible(i < visible_count)
+                if i < visible_count:
+                    lbl_widgets[i].setText(labels[i])
+                ch_selectors[i].setVisible(i < visible_count)
+
+        mode_combo.currentIndexChanged.connect(on_mode_changed)
+        on_mode_changed(0)  # 默认四元数
+
+        layout.addWidget(ctrl)
+
+        # ---- 3D 视口 ----
+        gl_view = gl.GLViewWidget()
+        gl_view.setBackgroundColor(QColor('#1a1a1a'))
+        gl_view.setCameraPosition(distance=5, elevation=25, azimuth=45)
+
+        # 坐标轴（自定义彩色线条）
+        axis_size = 2.0
+        x_axis = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [axis_size, 0, 0]]),
+            color=(1, 0.3, 0.3, 1), width=2, antialias=True)
+        y_axis = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [0, axis_size, 0]]),
+            color=(0.3, 1, 0.3, 1), width=2, antialias=True)
+        z_axis = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [0, 0, axis_size]]),
+            color=(0.3, 0.5, 1, 1), width=2, antialias=True)
+        gl_view.addItem(x_axis)
+        gl_view.addItem(y_axis)
+        gl_view.addItem(z_axis)
+
+        # 参考网格（仅 XZ 水平面，间距 1.0 清爽不杂乱）
+        grid = gl.GLGridItem(color=(180, 180, 195, 160))
+        grid.setSize(4, 4)
+        grid.setSpacing(0.5, 0.5)
+        gl_view.addItem(grid)
+
+        # 重置视角按钮
+        btn_reset_view = QPushButton("⟳ 重置视角", gl_view)
+        btn_reset_view.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(40, 40, 40, 200);
+                color: #cccccc;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px 10px;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: rgba(80, 80, 80, 220); color: #fff; border: 1px solid #007acc; }
+        """)
+        btn_reset_view.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_reset_view.move(10, 10)
+        btn_reset_view.clicked.connect(
+            lambda: gl_view.setCameraPosition(distance=5, elevation=25, azimuth=45))
+
+        # ---- 3D 长方体 (1.0 x 0.6 x 1.5) ----
+        # 顶点
+        hw, hh, hd = 0.5, 0.3, 0.75  # 半尺寸
+        verts = np.array([
+            [-hw, -hh, -hd], [ hw, -hh, -hd], [ hw,  hh, -hd], [-hw,  hh, -hd],  # 前 (-Z)
+            [-hw, -hh,  hd], [ hw, -hh,  hd], [ hw,  hh,  hd], [-hw,  hh,  hd],  # 后 (+Z)
+        ], dtype=np.float32)
+        # 三角面片 (每面2个三角形，共12个面)
+        faces = np.array([
+            # -Z面(前) 暗蓝
+            [0,1,2], [0,2,3],
+            # +Z面(后) 亮蓝
+            [4,6,5], [4,7,6],
+            # -X面(左) 暗红
+            [0,4,5], [0,5,1],
+            # +X面(右) 亮红
+            [2,6,7], [2,7,3],
+            # -Y面(底) 暗绿
+            [0,3,7], [0,7,4],
+            # +Y面(顶) 亮绿
+            [1,5,6], [1,6,2],
+        ], dtype=np.int32)
+        # 面颜色
+        face_colors = np.array([
+            [0.2, 0.3, 0.8, 0.85], [0.2, 0.3, 0.8, 0.85],   # -Z 蓝色
+            [0.4, 0.5, 1.0, 0.85], [0.4, 0.5, 1.0, 0.85],   # +Z 亮蓝
+            [0.8, 0.2, 0.2, 0.85], [0.8, 0.2, 0.2, 0.85],   # -X 红色
+            [1.0, 0.3, 0.3, 0.85], [1.0, 0.3, 0.3, 0.85],   # +X 亮红
+            [0.2, 0.7, 0.2, 0.85], [0.2, 0.7, 0.2, 0.85],   # -Y 绿色
+            [0.3, 1.0, 0.3, 0.85], [0.3, 1.0, 0.3, 0.85],   # +Y 亮绿
+        ], dtype=np.float32)
+
+        md = gl.MeshData(vertexes=verts, faces=faces, faceColors=face_colors)
+        box_mesh = gl.GLMeshItem(meshdata=md, smooth=False, shader='shaded',
+                                  drawEdges=True, edgeColor=(0.5, 0.5, 0.5, 0.5))
+        gl_view.addItem(box_mesh)
+
+        layout.addWidget(gl_view, stretch=1)
+
+        # 挂在 widget 上的属性
+        container.mode_combo = mode_combo
+        container.ch_selectors = ch_selectors
+        container.gl_view = gl_view
+        container.box_mesh = box_mesh
+        container.curves = []  # 兼容 update 循环
+
+        # 初始化通道列表
+        self._refresh_imu_channels(widget=container)
+        return container
+
+    def _refresh_all_imu_channels(self):
+        """刷新所有 IMU 窗口的通道选择器"""
+        for sub in self.mdi_area.subWindowList():
+            if sub.property('window_type') == 'imu':
+                w = sub.widget()
+                if w and hasattr(w, 'ch_selectors'):
+                    self._refresh_imu_channels(widget=w)
+
+    def _refresh_imu_channels(self, widget):
+        """刷新 IMU 窗口的通道选择器列表"""
+        ch_names = []
+        for i in range(len(self.data_history)):
+            name = (self.channel_widgets[i]["name_edit"].text().strip()
+                    if i < len(self.channel_widgets) else f"CH{i+1}")
+            ch_names.append(f"CH{i+1}:{name}")
+        if not ch_names:
+            ch_names = ["(无通道)"]
+        for sel in widget.ch_selectors:
+            current = sel.currentText()
+            sel.blockSignals(True)
+            sel.clear()
+            sel.addItems(ch_names)
+            if current in ch_names:
+                sel.setCurrentText(current)
+            sel.blockSignals(False)
+        # 更新模式显示（可能通道数变了）
+        widget.mode_combo.currentIndexChanged.emit(widget.mode_combo.currentIndex())
+
     def add_window(self):
         """根据下拉框选择添加新窗口"""
         window_type_name = self.combo_add_window.currentText()
@@ -1397,7 +1575,7 @@ class MainWindow(QMainWindow):
         base_name = window_type_name
         key = self.window_type_map[window_type_name]
         if not hasattr(self, 'window_counter'):
-            self.window_counter = {'time': 0, 'fft': 0}
+            self.window_counter = {'time': 0, 'fft': 0, 'imu': 0}
         self.window_counter[key] += 1
         if self.window_counter[key] > 1:
             title = f"{base_name} {self.window_counter[key]}"
@@ -1826,7 +2004,6 @@ class MainWindow(QMainWindow):
             # 限制比例在 0.5% 到 99.5% 之间
             self.meas_frac_A = max(0.005, min(0.995, raw_frac))
             
-            # 2. 如果游标因为底层 bug 越界，切断信号并强制拉回！
             if raw_frac < 0.005 or raw_frac > 0.995:
                 self.meas_line_A.blockSignals(True)
                 self.meas_line_A.setValue(xr[0] + self.meas_frac_A * span)
@@ -2012,7 +2189,7 @@ class MainWindow(QMainWindow):
         """当鼠标彻底移出波形区域时，清理所有悬浮UI"""
         self.last_mouse_pos = None
         
-        # 隐藏十字线（通过主 plot_widget）
+        # 隐藏十字线
         if hasattr(self, 'plot_widget'):
             self.plot_widget.v_line.setVisible(False)
             self.plot_widget.h_line.setVisible(False)
@@ -2046,7 +2223,7 @@ class MainWindow(QMainWindow):
         curve.setVisible(saved_checked)
         self.curves.append(curve)
         
-        # 频域曲线（如果 fft_plot 存在）
+        # 频域曲线
         if self.fft_plot is not None:
             fft_curve = self.fft_plot.plot(pen=pg.mkPen(color=saved_color, width=self.spin_linewidth.value()))
             fft_curve.setVisible(saved_checked)
@@ -2118,8 +2295,9 @@ class MainWindow(QMainWindow):
         num_signals = matrix.shape[0]
         frames = matrix.shape[1]
         self.total_frames_received += frames
-        self.total_bytes_received += frames * (num_signals * 4 + 4) 
+        self.total_bytes_received += frames * (num_signals * 4 + 4)
 
+        old_num_channels = len(self.data_history)
         while len(self.data_history) > num_signals:
             self.data_history.pop() # 移除数据缓存
             # 从时域图表中移除曲线
@@ -2143,7 +2321,11 @@ class MainWindow(QMainWindow):
         while len(self.data_history) < num_signals:
             self.data_history.append(CircularBuffer(self.max_memory_points))
             self.create_channel_ui(len(self.data_history) - 1)
-            
+
+        # 刷新 IMU 通道列表
+        if len(self.data_history) != old_num_channels:
+            self._refresh_all_imu_channels()
+
         self.time_history.extend(t_array + self.time_offset)
         for i in range(num_signals): 
             self.data_history[i].extend(matrix[i])
@@ -2328,6 +2510,72 @@ class MainWindow(QMainWindow):
                 else:
                     parent_widget.fft_hud_label.hide()
 
+    # ==================== IMU 姿态计算 ====================
+    def _get_channel_value(self, ch_idx):
+        """读取指定通道的最新值"""
+        if ch_idx < 0 or ch_idx >= len(self.data_history):
+            return 0.0
+        if self.data_history[ch_idx].total_count == 0:
+            return 0.0
+        val = self.data_history[ch_idx].get_val_at_abs(
+            self.data_history[ch_idx].total_count - 1)
+        return float(val) if val is not None else 0.0
+
+    @staticmethod
+    def _quat_to_matrix(w, x, y, z):
+        """四元数 → 3x3 旋转矩阵"""
+        n = np.sqrt(w*w + x*x + y*y + z*z)
+        if n < 1e-12:
+            return np.eye(3, dtype=np.float32)
+        w, x, y, z = w/n, x/n, y/n, z/n
+        return np.array([
+            [1-2*y*y-2*z*z, 2*x*y-2*w*z, 2*x*z+2*w*y],
+            [2*x*y+2*w*z, 1-2*x*x-2*z*z, 2*y*z-2*w*x],
+            [2*x*z-2*w*y, 2*y*z+2*w*x, 1-2*x*x-2*y*y],
+        ], dtype=np.float32)
+
+    @staticmethod
+    def _euler_to_matrix(roll, pitch, yaw):
+        """欧拉角 ZYX (yaw-pitch-roll, 度) → 3x3 旋转矩阵"""
+        r, p, y = np.radians(roll), np.radians(pitch), np.radians(yaw)
+        cr, sr = np.cos(r), np.sin(r)
+        cp, sp = np.cos(p), np.sin(p)
+        cy, sy = np.cos(y), np.sin(y)
+        # R = Rz(yaw) * Ry(pitch) * Rx(roll)
+        return np.array([
+            [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+            [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+            [-sp,   cp*sr,            cp*cr],
+        ], dtype=np.float32)
+
+    def update_imu_window(self, widget):
+        """更新单个 IMU 窗口的姿态"""
+        if not self.data_history:
+            return
+        mode = widget.mode_combo.currentIndex()
+        sel = widget.ch_selectors
+        if mode == 0:  # 四元数
+            w = self._get_channel_value(sel[0].currentIndex() if sel[0].count() > 0 else -1)
+            x = self._get_channel_value(sel[1].currentIndex() if sel[1].count() > 0 else -1)
+            y = self._get_channel_value(sel[2].currentIndex() if sel[2].count() > 0 else -1)
+            z = self._get_channel_value(sel[3].currentIndex() if sel[3].count() > 0 else -1)
+            R = self._quat_to_matrix(w, x, y, z)
+        else:  # 欧拉角
+            roll = self._get_channel_value(sel[0].currentIndex() if sel[0].count() > 0 else -1)
+            pitch = self._get_channel_value(sel[1].currentIndex() if sel[1].count() > 0 else -1)
+            yaw = self._get_channel_value(sel[2].currentIndex() if sel[2].count() > 0 else -1)
+            R = self._euler_to_matrix(roll, pitch, yaw)
+
+        # 构建 4x4 齐次变换矩阵
+        mat = QMatrix4x4(
+            R[0,0], R[0,1], R[0,2], 0,
+            R[1,0], R[1,1], R[1,2], 0,
+            R[2,0], R[2,1], R[2,2], 0,
+            0,      0,      0,      1,
+        )
+        widget.box_mesh.resetTransform()
+        widget.box_mesh.setTransform(mat)
+
     def update_plot_display(self):
         if not self.data_history:
             return
@@ -2433,6 +2681,13 @@ class MainWindow(QMainWindow):
                 if hasattr(widget, 'fft_plot') and hasattr(widget, 'fft_curves'):
                     # 更新频谱数据，不更新HUD（HUD只有第一个频域窗口需要，但这里简化）
                     self.update_fft_plot(widget.fft_plot, widget.fft_curves, chunk_start, chunk_end, x_data_full, interval, use_real_time, update_hud=False)
+
+        # ---- 更新 IMU 窗口 ----
+        for sub in self.mdi_area.subWindowList():
+            if sub.property('window_type') == 'imu' and sub.isVisible():
+                widget = sub.widget()
+                if hasattr(widget, 'box_mesh') and self.data_history:
+                    self.update_imu_window(widget)
 
         # ---- 统计表格 ----
         active_left_tab = self.left_tabs.currentIndex()
@@ -2611,7 +2866,7 @@ class MainWindow(QMainWindow):
         for lbl in self.hud_labels: 
             lbl.hide()
         self.time_hud_label.hide()
-        self.crosshair_dots.setData([], [])
+        self.plot_widget.crosshair_dots.setData([], [])
         
         self.table_stats.clearContents()
         self.table_stats.setRowCount(0)
@@ -2779,6 +3034,8 @@ class MainWindow(QMainWindow):
                             widget = self.create_time_widget()
                         elif win_type == 'fft':
                             widget = self.create_fft_widget()
+                        elif win_type == 'imu':
+                            widget = self.create_imu_widget()
                         else:
                             continue
 
@@ -2806,6 +3063,14 @@ class MainWindow(QMainWindow):
                             QTimer.singleShot(0, lambda s=sub: s.apply_frac_geometry())
                         else:
                             sub.setGeometry(x, y, width, height)
+
+                        # 恢复 IMU 窗口配置（模式 + 通道映射）
+                        if win_type == 'imu' and 'imu_mode' in win_data:
+                            widget.mode_combo.setCurrentIndex(win_data['imu_mode'])
+                            saved_ch = win_data.get('imu_channels', [])
+                            for i, idx in enumerate(saved_ch):
+                                if i < len(widget.ch_selectors) and idx < widget.ch_selectors[i].count():
+                                    widget.ch_selectors[i].setCurrentIndex(idx)
 
                         # 如果是频域窗口且还没有设置主频域，则设置
                         if win_type == 'fft' and self.fft_plot is None:
@@ -2910,6 +3175,14 @@ class MainWindow(QMainWindow):
                     win_data['y_frac'] = frac[1]
                     win_data['w_frac'] = frac[2]
                     win_data['h_frac'] = frac[3]
+                # 保存 IMU 窗口配置
+                if sub.property('window_type') == 'imu':
+                    w = sub.widget()
+                    if w and hasattr(w, 'mode_combo'):
+                        win_data['imu_mode'] = w.mode_combo.currentIndex()
+                        win_data['imu_channels'] = [
+                            sel.currentIndex() for sel in w.ch_selectors
+                        ]
                 window_list.append(win_data)
         self.settings.setValue("window_list", window_list)
         print(f"[保存配置] 已保存 {len(window_list)} 个窗口")
