@@ -165,6 +165,28 @@ class MdiTitleBar(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.sub_window.isMaximized():
+            # 如果点击在顶部边缘 GRIP 范围内 → 交给子窗口缩放句柄处理
+            if hasattr(self.sub_window, '_get_resize_edge'):
+                local_y = event.position().toPoint().y()
+                local_x = event.position().toPoint().x()
+                w = self.sub_window.width()
+                g = self.sub_window.GRIP_SIZE
+                edge = None
+                if local_y < g:
+                    if local_x < g:       edge = 'topleft'
+                    elif local_x > w - g: edge = 'topright'
+                    else:                 edge = 'top'
+                elif local_x < g:          edge = 'left'
+                elif local_x > w - g:      edge = 'right'
+                if edge is not None:
+                    sub = self.sub_window
+                    sub._resize_edge = edge
+                    sub._resize_start_geo = sub.geometry()
+                    sub._resize_start_global = event.globalPosition().toPoint()
+                    sub._resizing = True
+                    sub._snap_enabled = False
+                    event.accept()
+                    return
             self._drag_start_global = event.globalPosition().toPoint()
             self._drag_start_pos = self.sub_window.pos()
             event.accept()
@@ -172,6 +194,48 @@ class MdiTitleBar(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        sub = self.sub_window
+        # 如果子窗口正在被缩放（从标题栏区域发起的边缘缩放）
+        if hasattr(sub, '_resize_edge') and sub._resize_edge is not None \
+                and hasattr(sub, '_resize_start_geo') and sub._resize_start_geo is not None:
+            delta = event.globalPosition().toPoint() - sub._resize_start_global
+            geo = QRectF(sub._resize_start_geo)
+            edge = sub._resize_edge
+            min_w, min_h = sub.minimumWidth(), sub.minimumHeight()
+            if 'left' in edge:
+                geo.setLeft(min(geo.left() + delta.x(), geo.right() - min_w))
+            if 'right' in edge:
+                geo.setRight(max(geo.right() + delta.x(), geo.left() + min_w))
+            if 'top' in edge:
+                geo.setTop(min(geo.top() + delta.y(), geo.bottom() - min_h))
+            if 'bottom' in edge:
+                geo.setBottom(max(geo.bottom() + delta.y(), geo.top() + min_h))
+            snapped = sub._snap_resize_geometry(geo, edge)
+            new_geo = snapped.toRect()
+            sub._updating_geometry = True
+            sub.setGeometry(new_geo)
+            sub._updating_geometry = False
+            event.accept()
+            return
+
+        # 非拖拽/缩放状态：更新光标形状
+        if not sub.isMaximized() and hasattr(sub, '_get_resize_edge'):
+            local = event.position().toPoint()
+            edge = sub._get_resize_edge(QPoint(local.x(), local.y()))
+            cursor_map = {
+                'left': Qt.CursorShape.SizeHorCursor,
+                'right': Qt.CursorShape.SizeHorCursor,
+                'top': Qt.CursorShape.SizeVerCursor,
+                'bottom': Qt.CursorShape.SizeVerCursor,
+                'topleft': Qt.CursorShape.SizeFDiagCursor,
+                'bottomright': Qt.CursorShape.SizeFDiagCursor,
+                'topright': Qt.CursorShape.SizeBDiagCursor,
+                'bottomleft': Qt.CursorShape.SizeBDiagCursor,
+            }
+            self.setCursor(cursor_map.get(edge, Qt.CursorShape.ArrowCursor))
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
         if self._drag_start_global is not None and self._drag_start_pos is not None:
             delta = event.globalPosition().toPoint() - self._drag_start_global
             self.sub_window.move(self._drag_start_pos + delta)
@@ -180,6 +244,15 @@ class MdiTitleBar(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        sub = self.sub_window
+        if hasattr(sub, '_resize_edge') and sub._resize_edge is not None:
+            sub._resize_edge = None
+            sub._resize_start_geo = None
+            sub._resize_start_global = None
+            sub._resizing = False
+            sub._snap_enabled = True
+            sub._constrain_geometry()
+            sub.update_frac_geometry()
         self._drag_start_global = None
         self._drag_start_pos = None
         super().mouseReleaseEvent(event)
@@ -187,6 +260,7 @@ class MdiTitleBar(QWidget):
 class SnapMdiSubWindow(QMdiSubWindow):
     _all_windows = []
     _parent_resizing = False       # 类级别标志：主窗口正在缩放时，所有子窗口跳过约束
+    GRIP_SIZE = 8                  # 边缘缩放感应区宽度 (px)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -201,15 +275,22 @@ class SnapMdiSubWindow(QMdiSubWindow):
         self._move_timer.timeout.connect(self._on_move_finished)
         self._updating_geometry = False    # 防止递归
         self._frac_geometry = None         # (x_frac, y_frac, w_frac, h_frac) 比例坐标
+        # 自定义缩放句柄状态
+        self._resize_edge = None           # None / 边名字符串
+        self._resize_start_geo = None      # QRect: 缩放前的窗口几何
+        self._resize_start_global = None   # QPoint: 缩放前的全局鼠标位置
         self.setMinimumSize(50, 50)
         transparent_icon = QPixmap(1, 1)
         transparent_icon.fill(Qt.GlobalColor.transparent)
         self.setWindowIcon(QIcon(transparent_icon))
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        self.setMouseTracking(True)
         self._title_bar = MdiTitleBar(self)
         self._content_widget = None
         self._wrapper_widget = None
         SnapMdiSubWindow._all_windows.append(self)
+        # 安装全局事件过滤器，捕获所有子孙 widget 的鼠标事件用于边缘缩放
+        QApplication.instance().installEventFilter(self)
 
     def setWindowTitle(self, title):
         super().setWindowTitle(title)
@@ -219,6 +300,7 @@ class SnapMdiSubWindow(QMdiSubWindow):
     def setWidget(self, widget):
         self._content_widget = widget
         wrapper = QWidget()
+        wrapper.setMouseTracking(True)
         wrapper.setObjectName("mdiWindowFrame")
         wrapper.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         wrapper.setStyleSheet("""
@@ -237,6 +319,227 @@ class SnapMdiSubWindow(QMdiSubWindow):
 
     def widget(self):
         return self._content_widget if self._content_widget is not None else super().widget()
+
+    def eventFilter(self, obj, event):
+        """全局事件过滤器：拦截属于本子窗口的鼠标事件，处理边缘缩放和光标切换。"""
+        from PyQt6.QtCore import QEvent, Qt
+        from PyQt6.QtWidgets import QWidget
+        from PyQt6.QtCore import QRectF
+
+        if not isinstance(obj, QWidget):
+            return super().eventFilter(obj, event)
+
+        etype = event.type()
+        if etype not in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseMove,
+                        QEvent.Type.MouseButtonRelease):
+            return super().eventFilter(obj, event)
+        if self.isMaximized() or not self.isVisible():
+            return super().eventFilter(obj, event)
+
+        # 跳过标题栏（标题栏自己处理鼠标）
+        if obj is self._title_bar:
+            return super().eventFilter(obj, event)
+
+        if obj is not self and not self.isAncestorOf(obj):
+            return super().eventFilter(obj, event)
+
+        if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            sub_local = self._map_to_sub_window(obj, event.position().toPoint())
+            if sub_local is not None:
+                edge = self._get_resize_edge(sub_local)
+                if edge is not None and self._title_bar is not None \
+                        and self._title_bar._drag_start_global is None:
+                    self._resize_edge = edge
+                    self._resize_start_geo = self.geometry()
+                    self._resize_start_global = event.globalPosition().toPoint()
+                    self._resizing = True
+                    self._snap_enabled = False
+                    return True
+
+        elif etype == QEvent.Type.MouseMove:
+            if self._resize_edge is not None and self._resize_start_geo is not None:
+                delta = event.globalPosition().toPoint() - self._resize_start_global
+                geo = QRectF(self._resize_start_geo)
+                edge = self._resize_edge
+                min_w, min_h = self.minimumWidth(), self.minimumHeight()
+                if 'left' in edge:
+                    geo.setLeft(min(geo.left() + delta.x(), geo.right() - min_w))
+                if 'right' in edge:
+                    geo.setRight(max(geo.right() + delta.x(), geo.left() + min_w))
+                if 'top' in edge:
+                    geo.setTop(min(geo.top() + delta.y(), geo.bottom() - min_h))
+                if 'bottom' in edge:
+                    geo.setBottom(max(geo.bottom() + delta.y(), geo.top() + min_h))
+                snapped = self._snap_resize_geometry(geo, edge)
+                new_geo = snapped.toRect()
+                self._updating_geometry = True
+                self.setGeometry(new_geo)
+                self._updating_geometry = False
+                return True
+
+            sub_local = self._map_to_sub_window(obj, event.position().toPoint())
+            if sub_local is not None:
+                edge = self._get_resize_edge(sub_local)
+                if edge is not None:
+                    self.setCursor(self._RESIZE_CURSORS.get(edge, Qt.CursorShape.ArrowCursor))
+                else:
+                    self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        elif etype == QEvent.Type.MouseButtonRelease:
+            if self._resize_edge is not None:
+                self._resize_edge = None
+                self._resize_start_geo = None
+                self._resize_start_global = None
+                self._resizing = False
+                self._snap_enabled = True
+                self._constrain_geometry()
+                self.update_frac_geometry()
+                return True
+
+        return super().eventFilter(obj, event)
+
+    def _map_to_sub_window(self, obj, local_pos):
+        """将某个子孙 widget 内的局部坐标映射到 SnapMdiSubWindow 的坐标。"""
+        try:
+            return obj.mapTo(self, local_pos)
+        except RuntimeError:
+            return None
+
+    def _get_resize_edge(self, pos):
+        """根据窗口内局部坐标 pos 判断鼠标落在哪个缩放边/角。"""
+        if self.isMaximized():
+            return None
+        w, h = self.width(), self.height()
+        g = self.GRIP_SIZE
+        left = pos.x() < g
+        right = pos.x() > w - g
+        top = pos.y() < g
+        bottom = pos.y() > h - g
+        if top and left:     return 'topleft'
+        if top and right:    return 'topright'
+        if bottom and left:  return 'bottomleft'
+        if bottom and right: return 'bottomright'
+        if left:             return 'left'
+        if right:            return 'right'
+        if top:              return 'top'
+        if bottom:           return 'bottom'
+        return None
+
+    _RESIZE_CURSORS = {
+        'left': Qt.CursorShape.SizeHorCursor,
+        'right': Qt.CursorShape.SizeHorCursor,
+        'top': Qt.CursorShape.SizeVerCursor,
+        'bottom': Qt.CursorShape.SizeVerCursor,
+        'topleft': Qt.CursorShape.SizeFDiagCursor,
+        'bottomright': Qt.CursorShape.SizeFDiagCursor,
+        'topright': Qt.CursorShape.SizeBDiagCursor,
+        'bottomleft': Qt.CursorShape.SizeBDiagCursor,
+    }
+
+    def _snap_resize_geometry(self, geo, edge, threshold=15):
+        """缩放时对拖拽边做邻窗吸附，返回调整后的 QRect。"""
+        x, y, w, h = geo.x(), geo.y(), geo.width(), geo.height()
+        neighbor_edges = self._get_neighbor_edges(geo)
+
+        if 'left' in edge:
+            for etype, val in neighbor_edges:
+                if etype in ('left', 'right') and abs(x - val) < threshold:
+                    x = val
+                    break
+            for etype, val in neighbor_edges:
+                if etype in ('left', 'right') and abs(x + w - val) < threshold:
+                    pass  # 拖左边缘时右边缘不动
+
+        if 'right' in edge:
+            right_edge = x + w
+            for etype, val in neighbor_edges:
+                if etype in ('left', 'right') and abs(right_edge - val) < threshold:
+                    w = val - x
+                    break
+
+        if 'top' in edge:
+            for etype, val in neighbor_edges:
+                if etype in ('top', 'bottom') and abs(y - val) < threshold:
+                    y = val
+                    break
+
+        if 'bottom' in edge:
+            bottom_edge = y + h
+            for etype, val in neighbor_edges:
+                if etype in ('top', 'bottom') and abs(bottom_edge - val) < threshold:
+                    h = val - y
+                    break
+
+        parent_rect = self._get_parent_rect()
+        if parent_rect:
+            new_w = max(50, min(w, parent_rect.width()))
+            new_h = max(50, min(h, parent_rect.height()))
+            if 'left' in edge and w != new_w:
+                x = x + w - new_w
+            new_x = max(0, min(x, parent_rect.width() - new_w))
+            new_y = max(0, min(y, parent_rect.height() - new_h))
+            w, h = new_w, new_h
+            x, y = new_x, new_y
+
+        return QRectF(x, y, w, h) if isinstance(geo, QRectF) else geo.__class__(int(x), int(y), int(w), int(h))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and not self.isMaximized():
+            edge = self._get_resize_edge(event.position().toPoint())
+            if edge is not None:
+                self._resize_edge = edge
+                self._resize_start_geo = self.geometry()
+                self._resize_start_global = event.globalPosition().toPoint()
+                self._resizing = True
+                self._snap_enabled = False
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resize_edge is not None and self._resize_start_geo is not None:
+            delta = event.globalPosition().toPoint() - self._resize_start_global
+            geo = QRectF(self._resize_start_geo)
+            edge = self._resize_edge
+            if 'left' in edge:
+                geo.setLeft(min(geo.left() + delta.x(), geo.right() - self.minimumWidth()))
+            if 'right' in edge:
+                geo.setRight(max(geo.right() + delta.x(), geo.left() + self.minimumWidth()))
+            if 'top' in edge:
+                geo.setTop(min(geo.top() + delta.y(), geo.bottom() - self.minimumHeight()))
+            if 'bottom' in edge:
+                geo.setBottom(max(geo.bottom() + delta.y(), geo.top() + self.minimumHeight()))
+            snapped = self._snap_resize_geometry(geo, edge)
+            new_geo = snapped.toRect()
+            self._updating_geometry = True
+            self.setGeometry(new_geo)
+            self._updating_geometry = False
+            event.accept()
+            return
+
+        if not self.isMaximized():
+            edge = self._get_resize_edge(event.position().toPoint())
+            if edge is not None:
+                self.setCursor(self._RESIZE_CURSORS.get(edge, Qt.CursorShape.ArrowCursor))
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._resize_edge is not None:
+            self._resize_edge = None
+            self._resize_start_geo = None
+            self._resize_start_global = None
+            self._resizing = False
+            self._snap_enabled = True
+            self._constrain_geometry()
+            self.update_frac_geometry()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _get_parent_rect(self):
         """获取父窗口（QMdiArea）的可见视口矩形。
@@ -914,7 +1217,7 @@ class OscilloscopeCursor(pg.InfiniteLine):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ScopeV3.0" + GL_STATUS)
+        self.setWindowTitle("Scope V3.0" + GL_STATUS)
         self.resize(1400, 900)
         self.setStyleSheet(DARK_STYLE)
         self.last_crosshair_idx = -1
@@ -1522,10 +1825,27 @@ class MainWindow(QMainWindow):
         fft_plot.setDownsampling(ds=True, auto=True, mode='subsample')
         fft_plot.plotItem.vb.setMouseEnabled(y=not self.auto_scale_y)
 
+        # ---- 十字光标 ----
+        fft_plot.v_line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('#555555', width=1, style=Qt.PenStyle.DashLine))
+        fft_plot.h_line = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('#555555', width=1, style=Qt.PenStyle.DashLine))
+        fft_plot.addItem(fft_plot.v_line, ignoreBounds=True)
+        fft_plot.addItem(fft_plot.h_line, ignoreBounds=True)
+        fft_plot.v_line.setVisible(False)
+        fft_plot.h_line.setVisible(False)
+
+        fft_plot.crosshair_dots = pg.ScatterPlotItem(size=8, pen=pg.mkPen('#FFFFFF', width=1))
+        fft_plot.addItem(fft_plot.crosshair_dots, ignoreBounds=True)
+
         fft_hud_label = QLabel(fft_plot)
         fft_hud_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         fft_hud_label.setStyleSheet("background-color: rgba(25, 25, 25, 220); border: 1px solid #777777; font-size: 11px; padding: 4px 6px; font-family: 'Consolas'; border-radius: 4px;")
         fft_hud_label.hide()
+
+        # 频率十字光标标签
+        freq_hud_label = QLabel(fft_plot)
+        freq_hud_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        freq_hud_label.setStyleSheet("background-color: rgba(45, 45, 45, 230); border: 1px solid #888888; color: #ffffff; font-size: 11px; padding: 2px 5px; font-family: 'Consolas'; font-weight: bold; border-radius: 3px;")
+        freq_hud_label.hide()
 
         btn_reset_fft = QPushButton("🔍 复位 (0~Nyquist)", fft_plot)
         btn_reset_fft.setStyleSheet("""
@@ -1541,7 +1861,7 @@ class MainWindow(QMainWindow):
         """)
         btn_reset_fft.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_reset_fft.move(10, 10)
-        btn_reset_fft.clicked.connect(self.reset_fft_view)  # 注意 reset_fft_view 需要能够处理不同的 fft_plot
+        btn_reset_fft.clicked.connect(self.reset_fft_view)
 
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -1550,10 +1870,38 @@ class MainWindow(QMainWindow):
 
         container.fft_plot = fft_plot
         container.fft_hud_label = fft_hud_label
+        container.fft_freq_hud_label = freq_hud_label
         container.btn_reset_fft = btn_reset_fft
-
         container.fft_curves = []
-        container.fft_plot = fft_plot
+
+        # 每窗口独立的十字光标状态
+        container.fft_last_mouse_pos = None
+        container.fft_last_bin_idx = -1
+        container.fft_xf = None
+        container.fft_mags = {}
+        container.fft_channel_labels = []
+
+        # 鼠标跟踪
+        fft_plot.scene().sigMouseMoved.connect(
+            lambda evt, c=container: setattr(c, 'fft_last_mouse_pos', evt)
+        )
+        # 鼠标离开时清理
+        def _make_fft_leave(_fp, _c):
+            def _handler(ev):
+                _c.fft_last_mouse_pos = None
+                try:
+                    _fp.v_line.setVisible(False)
+                    _fp.h_line.setVisible(False)
+                    _fp.crosshair_dots.setVisible(False)
+                    _c.fft_freq_hud_label.hide()
+                    for lbl in _c.fft_channel_labels:
+                        lbl.hide()
+                except RuntimeError:
+                    pass
+                super(pg.PlotWidget, _fp).leaveEvent(ev)
+            return _handler
+        fft_plot.leaveEvent = _make_fft_leave(fft_plot, container)
+
         return container
 
     def create_imu_widget(self):
@@ -2059,7 +2407,8 @@ class MainWindow(QMainWindow):
             fs = 1000.0 / interval
 
         nyquist_freq = fs / 2.0
-        fft_plot.setXRange(0, nyquist_freq, padding=0.02)
+        # 用 disableAutoRange=False 设定范围但不锁定，用户仍可滚轮缩放，数据更新时自动跟随 Nyquist
+        fft_plot.plotItem.vb.setRange(xRange=(0, nyquist_freq), padding=0.02, disableAutoRange=False)
 
     def refresh_ports(self):
         current_ports = [port.device for port in serial.tools.list_ports.comports()]
@@ -2497,21 +2846,33 @@ class MainWindow(QMainWindow):
     def on_plot_mouse_leave(self, event):
         """当鼠标彻底移出波形区域时，清理所有悬浮UI"""
         self.last_mouse_pos = None
-        
+
         # 隐藏十字线
         if hasattr(self, 'plot_widget'):
-            self.plot_widget.v_line.setVisible(False)
-            self.plot_widget.h_line.setVisible(False)
-            self.plot_widget.crosshair_dots.setVisible(False)
-        
+            try:
+                self.plot_widget.v_line.setVisible(False)
+                self.plot_widget.h_line.setVisible(False)
+                self.plot_widget.crosshair_dots.setVisible(False)
+            except RuntimeError:
+                pass
+
         # 隐藏所有悬浮标签
-        self.time_hud_label.hide()
-        for lbl in self.hud_labels: 
-            lbl.hide()
-            
+        try:
+            self.time_hud_label.hide()
+        except RuntimeError:
+            pass
+        for lbl in self.hud_labels:
+            try:
+                lbl.hide()
+            except RuntimeError:
+                pass
+
         # 调用父类 leaveEvent
         if hasattr(self, 'plot_widget'):
-            super(pg.PlotWidget, self.plot_widget).leaveEvent(event)
+            try:
+                super(pg.PlotWidget, self.plot_widget).leaveEvent(event)
+            except RuntimeError:
+                pass
 
     def create_channel_ui(self, ch_idx):
         def_color = self.default_colors[ch_idx % len(self.default_colors)]
@@ -2599,6 +2960,12 @@ class MainWindow(QMainWindow):
         self.channel_widgets[ch_idx]["color_btn"].setStyleSheet(f"background-color: {hex_color}; border: 1px solid #ffffff;")
         self.channel_widgets[ch_idx]["label"].setStyleSheet(f"color: {hex_color}; font-weight: bold;")
         self.hud_labels[ch_idx].color_hex = hex_color
+        # 同步颜色到所有 FFT 窗口的十字光标标签
+        for sub in self.mdi_area.subWindowList():
+            if sub.property('window_type') == 'fft':
+                w = sub.widget()
+                if hasattr(w, 'fft_channel_labels') and ch_idx < len(w.fft_channel_labels):
+                    w.fft_channel_labels[ch_idx].color_hex = hex_color
 
     def handle_batch_matrix(self, matrix, t_array):
         num_signals = matrix.shape[0]
@@ -2619,6 +2986,18 @@ class MainWindow(QMainWindow):
             # 移除悬浮标签
             lbl = self.hud_labels.pop()
             self.plot_widget.removeItem(lbl)
+            # 移除所有 FFT 窗口的十字光标标签和 mag 缓存
+            for sub in self.mdi_area.subWindowList():
+                if sub.property('window_type') == 'fft':
+                    w = sub.widget()
+                    if hasattr(w, 'fft_channel_labels') and w.fft_channel_labels:
+                        fft_lbl = w.fft_channel_labels.pop()
+                        if hasattr(w, 'fft_plot'):
+                            w.fft_plot.removeItem(fft_lbl)
+                    if hasattr(w, 'fft_mags'):
+                        stale = [k for k in w.fft_mags if k >= len(self.data_history)]
+                        for k in stale:
+                            del w.fft_mags[k]
             # 销毁左侧面板的 UI 控件
             widgets = self.channel_widgets.pop()
             widgets["checkbox"].deleteLater()
@@ -2663,30 +3042,33 @@ class MainWindow(QMainWindow):
         for i, curve in enumerate(curves_list):
             if i >= len(self.channel_colors):
                 break
-            color = self.channel_colors[i]
-            pen = pg.mkPen(color=color, width=line_width)
-            if draw_mode == 0 or draw_mode == 1:  # 阶梯线或曲线
-                curve.setPen(pen)
-                curve.setSymbol(None)
-            elif draw_mode == 2:  # 散点
-                if show_symbols:
-                    curve.setPen(None)
-                    curve.setSymbol('o')
-                    curve.setSymbolSize(max(3, line_width * 2 + 1))
-                    curve.setSymbolBrush(color)
-                    curve.setSymbolPen(None)
-                else:
+            try:
+                color = self.channel_colors[i]
+                pen = pg.mkPen(color=color, width=line_width)
+                if draw_mode == 0 or draw_mode == 1:  # 阶梯线或曲线
                     curve.setPen(pen)
                     curve.setSymbol(None)
-            elif draw_mode == 3:  # 连线+散点
-                curve.setPen(pen)
-                if show_symbols:
-                    curve.setSymbol('o')
-                    curve.setSymbolSize(max(3, line_width * 2 + 1))
-                    curve.setSymbolBrush(color)
-                    curve.setSymbolPen(None)
-                else:
-                    curve.setSymbol(None)
+                elif draw_mode == 2:  # 散点
+                    if show_symbols:
+                        curve.setPen(None)
+                        curve.setSymbol('o')
+                        curve.setSymbolSize(max(3, line_width * 2 + 1))
+                        curve.setSymbolBrush(color)
+                        curve.setSymbolPen(None)
+                    else:
+                        curve.setPen(pen)
+                        curve.setSymbol(None)
+                elif draw_mode == 3:  # 连线+散点
+                    curve.setPen(pen)
+                    if show_symbols:
+                        curve.setSymbol('o')
+                        curve.setSymbolSize(max(3, line_width * 2 + 1))
+                        curve.setSymbolBrush(color)
+                        curve.setSymbolPen(None)
+                    else:
+                        curve.setSymbol(None)
+            except RuntimeError:
+                continue
 
         shared_x_step = None
         stacked_idx = 0
@@ -2703,28 +3085,37 @@ class MainWindow(QMainWindow):
                     else:
                         y_draw = y_data
 
-                    curve = curves_list[i]
-                    if mode == 0:  # 阶梯线
-                        if shared_x_step is None or len(shared_x_step) != len(x_data_full) * 2:
-                            shared_x_step = np.empty(2 * len(x_data_full), dtype=x_data_full.dtype)
-                            shared_x_step[0::2] = x_data_full
-                            if self.combo_x_axis.currentIndex() == 0:
-                                dt = (x_data_full[-1] - x_data_full[0]) / (len(x_data_full)-1) if len(x_data_full) > 1 else self.spin_interval.value()
-                                shared_x_step[1::2] = np.append(x_data_full[1:], x_data_full[-1] + dt)
-                            else:
-                                interval = self.spin_interval.value()
-                                shared_x_step[1::2] = (np.arange(chunk_start + 1, chunk_end + 1, dtype=np.float32)) * interval
-                        y_step = np.empty(2 * len(y_draw), dtype=np.float32)
-                        y_step[0::2] = y_draw
-                        y_step[1::2] = y_draw
-                        curve.setData(x=shared_x_step, y=y_step, skipFiniteCheck=True)
-                    else:
-                        curve.setData(x=x_data_full, y=y_draw, skipFiniteCheck=True)
+                    try:
+                        curve = curves_list[i]
+                        if mode == 0:  # 阶梯线
+                            if shared_x_step is None or len(shared_x_step) != len(x_data_full) * 2:
+                                shared_x_step = np.empty(2 * len(x_data_full), dtype=x_data_full.dtype)
+                                shared_x_step[0::2] = x_data_full
+                                if self.combo_x_axis.currentIndex() == 0:
+                                    dt = (x_data_full[-1] - x_data_full[0]) / (len(x_data_full)-1) if len(x_data_full) > 1 else self.spin_interval.value()
+                                    shared_x_step[1::2] = np.append(x_data_full[1:], x_data_full[-1] + dt)
+                                else:
+                                    interval = self.spin_interval.value()
+                                    shared_x_step[1::2] = (np.arange(chunk_start + 1, chunk_end + 1, dtype=np.float32)) * interval
+                            y_step = np.empty(2 * len(y_draw), dtype=np.float32)
+                            y_step[0::2] = y_draw
+                            y_step[1::2] = y_draw
+                            curve.setData(x=shared_x_step, y=y_step, skipFiniteCheck=True)
+                        else:
+                            curve.setData(x=x_data_full, y=y_draw, skipFiniteCheck=True)
+                    except RuntimeError:
+                        continue
                 else:
-                    curves_list[i].setData([], [], skipFiniteCheck=True)
+                    try:
+                        curves_list[i].setData([], [], skipFiniteCheck=True)
+                    except RuntimeError:
+                        continue
             else:
                 if i < len(curves_list):
-                    curves_list[i].setData([], [], skipFiniteCheck=True)
+                    try:
+                        curves_list[i].setData([], [], skipFiniteCheck=True)
+                    except RuntimeError:
+                        continue
 
         # 如果启用 HUD，则更新主窗口的悬浮标签（仅主窗口）
         if enable_hud:
@@ -2732,15 +3123,27 @@ class MainWindow(QMainWindow):
 
     def update_fft_plot(self, fft_plot, fft_curves_list, chunk_start, chunk_end, x_data_full, interval, use_real_time, update_hud=False):
         """更新频域频谱图，指定 fft_plot 和曲线列表"""
+        parent_widget = fft_plot.parent()  # container QWidget
         # ===== 确保 fft_curves_list 长度与 data_history 一致 =====
         num_channels = len(self.data_history)
         while len(fft_curves_list) < num_channels:
             color = self.channel_colors[len(fft_curves_list)] if len(fft_curves_list) < len(self.channel_colors) else '#FFFFFF'
             curve = fft_plot.plot(pen=pg.mkPen(color=color, width=max(1, self.spin_linewidth.value())))
             fft_curves_list.append(curve)
+            # 为每个新通道创建对应的十字光标标签
+            if parent_widget and hasattr(parent_widget, 'fft_channel_labels'):
+                lbl = pg.TextItem(anchor=(0, 0.5))
+                lbl.setZValue(100)
+                lbl.hide()
+                fft_plot.addItem(lbl, ignoreBounds=True)
+                parent_widget.fft_channel_labels.append(lbl)
         while len(fft_curves_list) > num_channels:
             curve = fft_curves_list.pop()
             fft_plot.removeItem(curve)
+            # 移除多余标签
+            if parent_widget and hasattr(parent_widget, 'fft_channel_labels') and parent_widget.fft_channel_labels:
+                lbl = parent_widget.fft_channel_labels.pop()
+                fft_plot.removeItem(lbl)
 
         html_text = "<b style='color:#ffffff; font-size:11px;'>各通道频谱峰值:</b><br/>"
         html_text += "<table style='border-collapse: collapse; margin-top: 4px;'>"
@@ -2769,6 +3172,12 @@ class MainWindow(QMainWindow):
                     if len(mag) > 1:
                         mag[0] = 0
 
+                    # 缓存 FFT 数据供十字光标使用
+                    if parent_widget and hasattr(parent_widget, 'fft_mags'):
+                        parent_widget.fft_mags[i] = mag
+                        if parent_widget.fft_xf is None or len(parent_widget.fft_xf) != len(xf):
+                            parent_widget.fft_xf = xf
+
                     channel_peaks = []
                     if len(mag) > 2:
                         local_max_mask = (mag[1:-1] > mag[:-2]) & (mag[1:-1] > mag[2:])
@@ -2795,18 +3204,35 @@ class MainWindow(QMainWindow):
                             html_text += "</tr>"
                         html_text += "<tr><td colspan='3' style='height:2px;'></td></tr>"
 
-                    fft_curves_list[i].setData(x=xf, y=mag)
+                    try:
+                        fft_curves_list[i].setData(x=xf, y=mag)
+                    except RuntimeError:
+                        pass
                 else:
-                    fft_curves_list[i].setData([], [])
+                    try:
+                        fft_curves_list[i].setData([], [])
+                    except RuntimeError:
+                        pass
             else:
                 if i < len(fft_curves_list):
-                    fft_curves_list[i].setData([], [])
+                    try:
+                        fft_curves_list[i].setData([], [])
+                    except RuntimeError:
+                        pass
 
         html_text += "</table>"
 
+        # 清理过期的 mag 缓存
+        if parent_widget and hasattr(parent_widget, 'fft_mags'):
+            stale = [k for k in parent_widget.fft_mags if k >= num_channels]
+            for k in stale:
+                del parent_widget.fft_mags[k]
+
+        # 渲染十字光标
+        self.render_fft_crosshair(fft_plot, parent_widget)
+
         # ===== 更新 HUD（仅当 update_hud=True） =====
         if update_hud:
-            parent_widget = fft_plot.parent()
             if parent_widget and hasattr(parent_widget, 'fft_hud_label'):
                 if has_peaks:
                     parent_widget.fft_hud_label.setText(html_text)
@@ -3080,7 +3506,8 @@ class MainWindow(QMainWindow):
             self.time_hud_label.hide()
             self.plot_widget.crosshair_dots.setVisible(False)
             for lbl in self.hud_labels:
-                lbl.hide()
+                try: lbl.hide()
+                except RuntimeError: pass
             return
 
         if self.last_mouse_pos is not None and self.plot_widget.sceneBoundingRect().contains(self.last_mouse_pos):
@@ -3151,44 +3578,47 @@ class MainWindow(QMainWindow):
                         if ch_idx < len(self.hud_labels):
                             lbl = self.hud_labels[ch_idx]
                             if is_visible and val is not None:
-                                draw_val = val
-                                if is_stacked:
-                                    y_data = self.data_history[ch_idx].get_data_slice(max(earliest_abs, current_len - self.visible_points), current_len)
-                                    if len(y_data) > 0:
-                                        ymin, ymax = y_data.min(), y_data.max()
-                                        span = ymax - ymin if ymax != ymin else 1.0
-                                        draw_val = (val - ymin) / span - stacked_idx * 1.5
-                                stacked_idx += 1
-                                
-                                x_dots.append(current_time_ms)
-                                y_dots.append(draw_val)
-                                brush_dots.append(pg.mkBrush(self.channel_colors[ch_idx]))
-                                
-                                custom_name = self.channel_widgets[ch_idx]["name_edit"].text().strip() or f"CH {ch_idx+1}"
-                                hex_color = getattr(lbl, 'color_hex', '#FFFFFF')
-                                plain_text = f"{custom_name}: {val:.{prec}f}"
-                                html_str = f'<div style="background-color: rgba(22,22,22,0.9); border: 1px solid {hex_color}; color: {hex_color}; font-size:11px; padding:2px; font-family: Consolas;">{plain_text}</div>'
-                                lbl.setHtml(html_str)
-                                
-                                view_range = vb.viewRange()
-                                span_x = view_range[0][1] - view_range[0][0]
-                                x_offset = span_x * 0.015
-                                
-                                fm = pg.Qt.QtGui.QFontMetrics(pg.Qt.QtGui.QFont('Consolas', 11))
-                                lbl_pixel_width = fm.horizontalAdvance(plain_text) + 0
-                                
-                                vb_width = vb.width()
-                                lbl_data_width = (lbl_pixel_width / vb_width) * span_x if vb_width > 0 else (span_x * 0.1)
+                                try:
+                                    draw_val = val
+                                    if is_stacked:
+                                        y_data = self.data_history[ch_idx].get_data_slice(max(earliest_abs, current_len - self.visible_points), current_len)
+                                        if len(y_data) > 0:
+                                            ymin, ymax = y_data.min(), y_data.max()
+                                            span = ymax - ymin if ymax != ymin else 1.0
+                                            draw_val = (val - ymin) / span - stacked_idx * 1.5
+                                    stacked_idx += 1
 
-                                if current_time_ms + x_offset + lbl_data_width > view_range[0][1]:
-                                    lbl.setAnchor((1, 0.5))
-                                    lbl.setPos(current_time_ms - x_offset, draw_val)
-                                else:
-                                    lbl.setAnchor((0, 0.5))
-                                    lbl.setPos(current_time_ms + x_offset, draw_val)
-                                
-                                lbl.show()
-                                
+                                    x_dots.append(current_time_ms)
+                                    y_dots.append(draw_val)
+                                    brush_dots.append(pg.mkBrush(self.channel_colors[ch_idx]))
+
+                                    custom_name = self.channel_widgets[ch_idx]["name_edit"].text().strip() or f"CH {ch_idx+1}"
+                                    hex_color = getattr(lbl, 'color_hex', '#FFFFFF')
+                                    plain_text = f"{custom_name}: {val:.{prec}f}"
+                                    html_str = f'<div style="background-color: rgba(22,22,22,0.9); border: 1px solid {hex_color}; color: {hex_color}; font-size:11px; padding:2px; font-family: Consolas;">{plain_text}</div>'
+                                    lbl.setHtml(html_str)
+
+                                    view_range = vb.viewRange()
+                                    span_x = view_range[0][1] - view_range[0][0]
+                                    x_offset = span_x * 0.015
+
+                                    fm = pg.Qt.QtGui.QFontMetrics(pg.Qt.QtGui.QFont('Consolas', 11))
+                                    lbl_pixel_width = fm.horizontalAdvance(plain_text) + 0
+
+                                    vb_width = vb.width()
+                                    lbl_data_width = (lbl_pixel_width / vb_width) * span_x if vb_width > 0 else (span_x * 0.1)
+
+                                    if current_time_ms + x_offset + lbl_data_width > view_range[0][1]:
+                                        lbl.setAnchor((1, 0.5))
+                                        lbl.setPos(current_time_ms - x_offset, draw_val)
+                                    else:
+                                        lbl.setAnchor((0, 0.5))
+                                        lbl.setPos(current_time_ms + x_offset, draw_val)
+
+                                    lbl.show()
+                                except RuntimeError:
+                                    pass
+
                     if x_dots:
                         self.plot_widget.crosshair_dots.setData(x=x_dots, y=y_dots, brush=brush_dots)
                         self.plot_widget.crosshair_dots.setVisible(True)
@@ -3203,7 +3633,146 @@ class MainWindow(QMainWindow):
         self.time_hud_label.hide()
         self.plot_widget.crosshair_dots.setVisible(False)
         for lbl in self.hud_labels:
-            lbl.hide()
+            try: lbl.hide()
+            except RuntimeError: pass
+
+    def render_fft_crosshair(self, fft_plot, widget):
+        """渲染 FFT 频域图的十字光标和通道幅值标签（镜像时域 render_independent_labels）"""
+        if widget is None:
+            return
+
+        if QApplication.mouseButtons() & Qt.MouseButton.LeftButton:
+            fft_plot.v_line.setVisible(False)
+            fft_plot.h_line.setVisible(False)
+            widget.fft_freq_hud_label.hide()
+            fft_plot.crosshair_dots.setVisible(False)
+            for lbl in widget.fft_channel_labels:
+                try: lbl.hide()
+                except RuntimeError: pass
+            return
+
+        if (widget.fft_last_mouse_pos is not None
+                and fft_plot.sceneBoundingRect().contains(widget.fft_last_mouse_pos)):
+            mouse_point = fft_plot.plotItem.vb.mapSceneToView(widget.fft_last_mouse_pos)
+            freq_val = mouse_point.x()
+
+            xf = widget.fft_xf
+            if xf is None or len(xf) < 2:
+                return
+
+            # 限制在 Nyquist 范围内
+            if freq_val < 0:
+                freq_val = 0
+            if freq_val > xf[-1]:
+                freq_val = xf[-1]
+
+            # 找最近的频率 bin
+            bin_idx = int(np.searchsorted(xf, freq_val))
+            if bin_idx >= len(xf):
+                bin_idx = len(xf) - 1
+            if bin_idx > 0 and abs(xf[bin_idx - 1] - freq_val) < abs(xf[bin_idx] - freq_val):
+                bin_idx -= 1
+
+            actual_freq = xf[bin_idx]
+
+            # 与上一帧同一 bin → 跳过
+            if bin_idx == getattr(widget, 'fft_last_bin_idx', -1):
+                return
+            widget.fft_last_bin_idx = bin_idx
+
+            # 竖线
+            fft_plot.v_line.setPos(actual_freq)
+            fft_plot.v_line.setVisible(True)
+            fft_plot.h_line.setVisible(True)
+
+            # 频率标签（widget 坐标，顶部）
+            widget.fft_freq_hud_label.setText(f"频率: {actual_freq:.2f} Hz")
+            widget.fft_freq_hud_label.adjustSize()
+
+            vb = fft_plot.plotItem.vb
+            view_range = vb.viewRange()
+            scene_pos_top = vb.mapViewToScene(QPointF(float(actual_freq), view_range[1][1]))
+            widget_pos_top = fft_plot.mapFromScene(scene_pos_top)
+
+            lx_freq, ly_freq = widget_pos_top.x() + 10, 0
+            if lx_freq + widget.fft_freq_hud_label.width() > fft_plot.width():
+                lx_freq = widget_pos_top.x() - widget.fft_freq_hud_label.width() - 10
+            widget.fft_freq_hud_label.move(int(lx_freq), int(ly_freq))
+            widget.fft_freq_hud_label.show()
+
+            # 各通道幅值标签 + crosshair 圆点
+            x_dots, y_dots, brush_dots = [], [], []
+            first_y_val = None
+            prec = self.spin_precision.value()
+
+            for ch_idx in range(len(self.data_history)):
+                is_visible = self.channel_widgets[ch_idx]["checkbox"].isChecked()
+
+                if ch_idx < len(widget.fft_channel_labels):
+                    lbl = widget.fft_channel_labels[ch_idx]
+                    try:
+                        if is_visible and ch_idx in widget.fft_mags:
+                            mag = widget.fft_mags[ch_idx]
+                            if bin_idx < len(mag):
+                                mag_val = float(mag[bin_idx])
+
+                                x_dots.append(actual_freq)
+                                y_dots.append(mag_val)
+                                brush_dots.append(pg.mkBrush(self.channel_colors[ch_idx]))
+
+                                if first_y_val is None:
+                                    first_y_val = mag_val
+
+                                custom_name = self.channel_widgets[ch_idx]["name_edit"].text().strip() or f"CH {ch_idx+1}"
+                                hex_color = self.channel_colors[ch_idx]
+                                lbl.color_hex = hex_color
+                                plain_text = f"{custom_name}: {mag_val:.{prec}f}"
+                                html_str = f'<div style="background-color: rgba(22,22,22,0.9); border: 1px solid {hex_color}; color: {hex_color}; font-size:11px; padding:2px; font-family: Consolas;">{plain_text}</div>'
+                                lbl.setHtml(html_str)
+
+                                span_x = view_range[0][1] - view_range[0][0]
+                                x_offset = span_x * 0.015
+                                fm = pg.Qt.QtGui.QFontMetrics(pg.Qt.QtGui.QFont('Consolas', 11))
+                                lbl_pixel_width = fm.horizontalAdvance(plain_text)
+                                vb_width = vb.width()
+                                lbl_data_width = (lbl_pixel_width / vb_width) * span_x if vb_width > 0 else (span_x * 0.1)
+
+                                if actual_freq + x_offset + lbl_data_width > view_range[0][1]:
+                                    lbl.setAnchor((1, 0.5))
+                                    lbl.setPos(actual_freq - x_offset, mag_val)
+                                else:
+                                    lbl.setAnchor((0, 0.5))
+                                    lbl.setPos(actual_freq + x_offset, mag_val)
+
+                                lbl.show()
+                            else:
+                                lbl.hide()
+                        else:
+                            lbl.hide()
+                    except RuntimeError:
+                        pass
+
+            # 更新 crosshair 圆点
+            if x_dots:
+                fft_plot.crosshair_dots.setData(x=x_dots, y=y_dots, brush=brush_dots)
+                fft_plot.crosshair_dots.setVisible(True)
+            else:
+                fft_plot.crosshair_dots.setVisible(False)
+
+            # 横线定位在第一个可见通道的幅值
+            if first_y_val is not None:
+                fft_plot.h_line.setPos(first_y_val)
+
+            return
+
+        # 鼠标不在绘图区域：全部隐藏
+        fft_plot.v_line.setVisible(False)
+        fft_plot.h_line.setVisible(False)
+        widget.fft_freq_hud_label.hide()
+        fft_plot.crosshair_dots.setVisible(False)
+        for lbl in widget.fft_channel_labels:
+            try: lbl.hide()
+            except RuntimeError: pass
 
     def clear_data(self):
         for i in range(len(self.data_history)):
@@ -3215,8 +3784,9 @@ class MainWindow(QMainWindow):
                 self.fft_curves[i].setData([], [])
         self.time_history.clear()
         self._reset_dynamic_time_axis(keep_time=False)
-        for lbl in self.hud_labels: 
-            lbl.hide()
+        for lbl in self.hud_labels:
+            try: lbl.hide()
+            except RuntimeError: pass
         self.time_hud_label.hide()
         self.plot_widget.crosshair_dots.setData([], [])
         
@@ -3351,6 +3921,9 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(self.settings.value("geometry"))
             if self.settings.contains("splitter_state"):
                 self._pending_splitter_state = self.settings.value("splitter_state")
+
+            # 恢复波形缓冲区数据（必须在窗口恢复前，以填充通道列表）
+            self._load_buffer_data()
 
             # 加载通信配置
             if self.settings.contains("protocol_index"):
@@ -3499,72 +4072,157 @@ class MainWindow(QMainWindow):
             self.comm_thread.stop()
         self.plot_timer.stop()
 
-        # 保存通用设置
-        self.settings.setValue("x_axis_mode", self.combo_x_axis.currentIndex())
-        self.settings.setValue("dynamic_time_window", self.spin_dynamic_time_window.value())
-        self.settings.setValue("draw_mode", self.combo_draw_mode.currentIndex())
-        self.settings.setValue("baudrate", self.baud_combo.currentText())
-        self.settings.setValue("precision", self.spin_precision.value())
-        self.settings.setValue("linewidth", self.spin_linewidth.value())
+        # 安全获取控件值的辅助函数
+        def safe_get(control, default=None):
+            try:
+                if hasattr(control, 'value'):
+                    return control.value()
+                elif hasattr(control, 'currentIndex'):
+                    return control.currentIndex()
+                elif hasattr(control, 'currentText'):
+                    return control.currentText()
+                elif hasattr(control, 'text'):
+                    return control.text()
+                return default
+            except RuntimeError:
+                return default
+
+        # 保存通用设置（所有访问控件的调用都用 safe_get 包装）
+        self.settings.setValue("x_axis_mode", safe_get(self.combo_x_axis, 0))
+        self.settings.setValue("dynamic_time_window", safe_get(self.spin_dynamic_time_window, 1000))
+        self.settings.setValue("draw_mode", safe_get(self.combo_draw_mode, 0))
+        self.settings.setValue("baudrate", safe_get(self.baud_combo, ""))
+        self.settings.setValue("precision", safe_get(self.spin_precision, 0))
+        self.settings.setValue("linewidth", safe_get(self.spin_linewidth, 1))
         self.settings.setValue("interval", self.configured_interval_ms)
-        self.settings.setValue("max_cache", self.spin_max_cache.value())
-        self.settings.setValue("visible_points", self.spin_visible_points.value())
+        self.settings.setValue("max_cache", safe_get(self.spin_max_cache, 10000))
+        self.settings.setValue("visible_points", safe_get(self.spin_visible_points, 1000))
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
 
         # 保存通信配置
-        self.settings.setValue("protocol_index", self.combo_protocol.currentIndex())
-        self.settings.setValue("port", self.port_combo.currentText())
-        self.settings.setValue("host", self.edit_host.text())
-        self.settings.setValue("port_num", self.spin_port.value())
+        self.settings.setValue("protocol_index", safe_get(self.combo_protocol, 0))
+        self.settings.setValue("port", safe_get(self.port_combo, ""))
+        self.settings.setValue("host", safe_get(self.edit_host, ""))
+        self.settings.setValue("port_num", safe_get(self.spin_port, 0))
 
-        # 保存窗口配置（含绝对坐标和比例坐标）
+        # 保存窗口列表
         window_list = []
         for sub in self.mdi_area.subWindowList():
             if sub.isVisible():
-                geo = sub.geometry()
-                frac = sub.get_frac_geometry() if isinstance(sub, SnapMdiSubWindow) else None
-                win_data = {
-                    'title': sub.windowTitle(),
-                    'type': sub.property('window_type'),
-                    'x': geo.x(),
-                    'y': geo.y(),
-                    'width': geo.width(),
-                    'height': geo.height(),
-                    'maximized': sub.isMaximized(),
-                }
-                if frac is not None:
-                    win_data['x_frac'] = frac[0]
-                    win_data['y_frac'] = frac[1]
-                    win_data['w_frac'] = frac[2]
-                    win_data['h_frac'] = frac[3]
-                # 保存 IMU 窗口配置
-                if sub.property('window_type') == 'imu':
-                    w = sub.widget()
-                    if w and hasattr(w, 'mode_combo'):
-                        win_data['imu_mode'] = w.mode_combo.currentIndex()
-                        win_data['imu_channels'] = [
-                            int(w.imu_channel_indices[i]) if hasattr(w, 'imu_channel_indices') and i < len(w.imu_channel_indices)
-                            else sel.currentIndex()
-                            for i, sel in enumerate(w.ch_selectors)
-                        ]
-                window_list.append(win_data)
+                try:
+                    geo = sub.geometry()
+                    frac = sub.get_frac_geometry() if isinstance(sub, SnapMdiSubWindow) else None
+                    win_data = {
+                        'title': sub.windowTitle(),
+                        'type': sub.property('window_type'),
+                        'x': geo.x(),
+                        'y': geo.y(),
+                        'width': geo.width(),
+                        'height': geo.height(),
+                        'maximized': sub.isMaximized(),
+                    }
+                    if frac is not None:
+                        win_data['x_frac'] = frac[0]
+                        win_data['y_frac'] = frac[1]
+                        win_data['w_frac'] = frac[2]
+                        win_data['h_frac'] = frac[3]
+                    # 保存 IMU 窗口配置
+                    if sub.property('window_type') == 'imu':
+                        w = sub.widget()
+                        if w and hasattr(w, 'mode_combo'):
+                            win_data['imu_mode'] = safe_get(w.mode_combo, 0)
+                            win_data['imu_channels'] = [
+                                int(w.imu_channel_indices[i]) if hasattr(w, 'imu_channel_indices') and i < len(w.imu_channel_indices)
+                                else safe_get(sel, 0)
+                                for i, sel in enumerate(w.ch_selectors)
+                            ]
+                    window_list.append(win_data)
+                except RuntimeError:
+                    continue
         self.settings.setValue("window_list", window_list)
         print(f"[保存配置] 已保存 {len(window_list)} 个窗口")
 
         # 保存通道配置
         for i, widgets in enumerate(self.channel_widgets):
-            self.settings.setValue(f"channel_name_{i}", widgets["name_edit"].text())
-            self.settings.setValue(f"channel_checked_{i}", "true" if widgets["checkbox"].isChecked() else "false")
-            if i < len(self.channel_colors):
-                self.settings.setValue(f"channel_color_{i}", self.channel_colors[i])
+            try:
+                self.settings.setValue(f"channel_name_{i}", safe_get(widgets["name_edit"], ""))
+                self.settings.setValue(f"channel_checked_{i}", "true" if widgets["checkbox"].isChecked() else "false")
+                if i < len(self.channel_colors):
+                    self.settings.setValue(f"channel_color_{i}", self.channel_colors[i])
+            except RuntimeError:
+                continue
+
+        # 保存波形缓冲区数据到 scope_data.npz
+        self._save_buffer_data()
 
         event.accept()
+
+    def _save_buffer_data(self):
+        """将 data_history 和 time_history 保存到 scope_data.npz"""
+        if not self.data_history:
+            return
+        try:
+            save_dict = {
+                'num_channels': len(self.data_history),
+                'time_total': self.time_history.total_count,
+                'time_head': self.time_history.head,
+                'time_max': self.time_history.max_len,
+                'time_buffer': self.time_history.buffer,
+            }
+            for i, buf in enumerate(self.data_history):
+                save_dict[f'ch{i}_total'] = buf.total_count
+                save_dict[f'ch{i}_head'] = buf.head
+                save_dict[f'ch{i}_max'] = buf.max_len
+                save_dict[f'ch{i}_buffer'] = buf.buffer
+            np.savez_compressed('scope_data.npz', **save_dict)
+            print(f"[保存数据] 已保存 {len(self.data_history)} 通道的波形数据到 scope_data.npz")
+        except Exception as e:
+            print(f"[保存数据] 失败: {e}")
+
+    def _load_buffer_data(self):
+        """从 scope_data.npz 恢复波形缓冲区数据"""
+        import os
+        if not os.path.exists('scope_data.npz'):
+            return
+        try:
+            data = np.load('scope_data.npz', allow_pickle=False)
+            num_channels = int(data['num_channels'])
+
+            # 恢复时间轴
+            self.time_history.max_len = int(data['time_max'])
+            self.time_history.buffer = data['time_buffer']
+            self.time_history.head = int(data['time_head'])
+            self.time_history.total_count = int(data['time_total'])
+
+            # 恢复每个通道
+            while len(self.data_history) < num_channels:
+                self.data_history.append(CircularBuffer(self.max_memory_points))
+                self.create_channel_ui(len(self.data_history) - 1)
+            for i in range(num_channels):
+                buf = self.data_history[i]
+                buf.max_len = int(data[f'ch{i}_max'])
+                buf.buffer = data[f'ch{i}_buffer']
+                buf.head = int(data[f'ch{i}_head'])
+                buf.total_count = int(data[f'ch{i}_total'])
+
+            # 对齐 time_history 和 data_history 的 max_len
+            self.max_memory_points = max(
+                self.max_memory_points,
+                self.time_history.max_len,
+                *(buf.max_len for buf in self.data_history)
+            )
+            self.spin_max_cache.setValue(self.max_memory_points)
+
+            print(f"[加载数据] 已从 scope_data.npz 恢复 {num_channels} 通道波形数据")
+        except Exception as e:
+            print(f"[加载数据] 失败: {e}")
 
 if __name__ == "__main__":
     import traceback
     try:
         app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(True)
         window = MainWindow()
         window.show()
         sys.exit(app.exec())

@@ -1,17 +1,25 @@
-# 删除旧的残留编译文件、打包配置和虚拟环境
-Remove-Item -Recurse -Force *.build, *.dist, build_out, venv_pack -ErrorAction SilentlyContinue
+  # 删除旧的残留编译文件、打包配置和虚拟环境
+  Remove-Item -Recurse -Force *.build, *.dist, build_out, venv_pack, *.spec -ErrorAction SilentlyContinue
 
-# 创建虚拟环境
-python -m venv venv_pack
+  # 创建虚拟环境
+  python -m venv venv_pack
 
-# 解锁当前窗口的脚本执行限制
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+  # 解锁当前窗口的脚本执行限制
+  Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
 
-# 激活虚拟环境
-.\venv_pack\Scripts\activate
+  # 激活虚拟环境
+  .\venv_pack\Scripts\activate
 
-# 升级安装工具
-python -m pip install --upgrade pip
+  # 升级安装工具
+  python -m pip install --upgrade pip
 
-# 打包为exe
-pyinstaller --noconsole --onefile --clean --collect-all pyqtgraph --name Scope Scope.py
+  # 安装项目依赖（必须先装，pyinstaller 才能分析依赖）
+  pip install pyinstaller pyqtgraph PyQt6 numpy pyserial
+
+  # 打包为exe（增加 OpenGL 和 GL 相关模块收集）
+  pyinstaller --noconsole --onefile --clean `
+      --collect-all pyqtgraph `
+      --collect-all pyqtgraph.opengl `
+      --hidden-import PyQt6.QtOpenGLWidgets `
+      --hidden-import PyQt6.sip `
+      --name Scope Scope.py

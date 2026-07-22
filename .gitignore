@@ -1,8 +1,32 @@
-config.ini
-.__pycache__/
-.settings/
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+*.toc
+*.pyz
+*.pkg
+*.exe
+*.lnk
+
+# 虚拟环境
+.venv_pack/
+venv/
+env/
+
+# IDE 配置
 .idea/
 .vscode/
 .clangd/
-.idea/
-git rm -r --cached .
+
+# 本地配置文件和数据
+config.ini
+scope_data.npz
+*.npz
+
+# 其他系统垃圾
+.DS_Store
+Thumbs.db
