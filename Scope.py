@@ -19,6 +19,7 @@ from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QTransform, QPolygonF, Q
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6.QtWidgets import QMdiArea, QMdiSubWindow
+from PyQt6 import sip
 
 if getattr(sys, 'frozen', False):
     sys.stdout = open(os.devnull, 'w')
@@ -439,21 +440,23 @@ class SnapMdiSubWindow(QMdiSubWindow):
     def _snap_resize_geometry(self, geo, edge, threshold=15):
         """缩放时对拖拽边做邻窗吸附，返回调整后的 QRect。"""
         x, y, w, h = geo.x(), geo.y(), geo.width(), geo.height()
+        right = x + w
+        bottom = y + h
+        min_w, min_h = self.minimumWidth(), self.minimumHeight()
         neighbor_edges = self._get_neighbor_edges(geo)
 
         if 'left' in edge:
             for etype, val in neighbor_edges:
                 if etype in ('left', 'right') and abs(x - val) < threshold:
                     x = val
+                    w = right - x
                     break
-            for etype, val in neighbor_edges:
-                if etype in ('left', 'right') and abs(x + w - val) < threshold:
-                    pass  # 拖左边缘时右边缘不动
 
         if 'right' in edge:
             right_edge = x + w
             for etype, val in neighbor_edges:
                 if etype in ('left', 'right') and abs(right_edge - val) < threshold:
+                    right = val
                     w = val - x
                     break
 
@@ -461,25 +464,66 @@ class SnapMdiSubWindow(QMdiSubWindow):
             for etype, val in neighbor_edges:
                 if etype in ('top', 'bottom') and abs(y - val) < threshold:
                     y = val
+                    h = bottom - y
                     break
 
         if 'bottom' in edge:
             bottom_edge = y + h
             for etype, val in neighbor_edges:
                 if etype in ('top', 'bottom') and abs(bottom_edge - val) < threshold:
+                    bottom = val
                     h = val - y
                     break
 
+        if 'left' in edge and w < min_w:
+            w = min_w
+            x = right - w
+        elif 'right' in edge and w < min_w:
+            w = min_w
+            right = x + w
+
+        if 'top' in edge and h < min_h:
+            h = min_h
+            y = bottom - h
+        elif 'bottom' in edge and h < min_h:
+            h = min_h
+            bottom = y + h
+
         parent_rect = self._get_parent_rect()
         if parent_rect:
-            new_w = max(50, min(w, parent_rect.width()))
-            new_h = max(50, min(h, parent_rect.height()))
-            if 'left' in edge and w != new_w:
-                x = x + w - new_w
-            new_x = max(0, min(x, parent_rect.width() - new_w))
-            new_y = max(0, min(y, parent_rect.height() - new_h))
-            w, h = new_w, new_h
-            x, y = new_x, new_y
+            pw, ph = parent_rect.width(), parent_rect.height()
+
+            if 'left' in edge:
+                fixed_right = min(max(right, min_w), pw)
+                if x < 0:
+                    x = 0
+                if x > fixed_right - min_w:
+                    x = fixed_right - min_w
+                w = fixed_right - x
+            elif 'right' in edge:
+                if x < 0:
+                    x = 0
+                right = min(max(x + min_w, x + w), pw)
+                w = right - x
+            else:
+                w = min(w, pw)
+                x = max(0, min(x, pw - w))
+
+            if 'top' in edge:
+                fixed_bottom = min(max(bottom, min_h), ph)
+                if y < 0:
+                    y = 0
+                if y > fixed_bottom - min_h:
+                    y = fixed_bottom - min_h
+                h = fixed_bottom - y
+            elif 'bottom' in edge:
+                if y < 0:
+                    y = 0
+                bottom = min(max(y + min_h, y + h), ph)
+                h = bottom - y
+            else:
+                h = min(h, ph)
+                y = max(0, min(y, ph - h))
 
         return QRectF(x, y, w, h) if isinstance(geo, QRectF) else geo.__class__(int(x), int(y), int(w), int(h))
 
@@ -1217,7 +1261,7 @@ class OscilloscopeCursor(pg.InfiniteLine):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Scope V3.0" + GL_STATUS)
+        self.setWindowTitle("Scope  V2.3" + GL_STATUS)
         self.resize(1400, 900)
         self.setStyleSheet(DARK_STYLE)
         self.last_crosshair_idx = -1
@@ -1281,6 +1325,14 @@ class MainWindow(QMainWindow):
         self.time_offset = 0.0
         self.meas_frac_A = 0.33          
         self.meas_frac_B = 0.66
+        self.comm_thread = None
+        self.main_time_sub = None
+        self.main_fft_sub = None
+        self._closing = False
+        self._loading_config = False
+        self.x_axis_mode = 0
+        # 窗口管理
+        self.window_counter = {'time': 0, 'fft': 0, 'imu': 0}
 
         left_axis = PrecisionAxisItem(orientation='left')
         left_axis.setStyle(autoExpandTextSpace=False, tickTextWidth=60)
@@ -1303,12 +1355,7 @@ class MainWindow(QMainWindow):
         
         if not self.is_meas_active:
             self.toggle_measurement_lines()
-            
-        self.comm_thread = None
-        self.main_time_sub = None
-        self.main_fft_sub = None
-        # 窗口管理
-        self.window_counter = {'time': 0, 'fft': 0, 'imu': 0}
+
         self.window_factories = {
             '时域波形': self.create_time_widget,
             '频域频谱': self.create_fft_widget,
@@ -1816,6 +1863,97 @@ class MainWindow(QMainWindow):
         tab_time.plot_widget = plot_widget
         return tab_time
 
+    def _set_main_time_window(self, sub, widget, rebuild_plot_items=False):
+        """把主时域引用绑定到当前可用的时域窗口。"""
+        self.plot_widget = widget.plot_widget
+        self.main_time_sub = sub
+        self.vofa_timeline = widget.vofa_timeline
+        self.spin_max_cache = widget.spin_max_cache
+        self.spin_interval = widget.spin_interval
+        self.spin_visible_points = widget.spin_visible_points
+        self.lbl_buffer_status = widget.lbl_buffer_status
+        self.btn_go_latest = widget.btn_go_latest
+        self.time_hud_label = widget.time_hud_label
+
+        if rebuild_plot_items:
+            self.curves = []
+            self.hud_labels = []
+            for ch_idx in range(len(self.data_history)):
+                checked = True
+                if ch_idx < len(self.channel_widgets):
+                    try:
+                        checked = self.channel_widgets[ch_idx]["checkbox"].isChecked()
+                    except RuntimeError:
+                        checked = True
+                curve = self.plot_widget.plot()
+                curve.setVisible(checked)
+                self.curves.append(curve)
+
+                lbl = pg.TextItem(anchor=(0, 0.5))
+                lbl.setZValue(100)
+                lbl.hide()
+                if ch_idx < len(self.channel_colors):
+                    lbl.color_hex = self.channel_colors[ch_idx]
+                self.plot_widget.addItem(lbl, ignoreBounds=True)
+                self.hud_labels.append(lbl)
+
+        self.meas_line_A = OscilloscopeCursor(angle=90, movable=True, label_text="A", pen=pg.mkPen('#ffcc00', width=1.5, style=Qt.PenStyle.SolidLine))
+        self.meas_line_B = OscilloscopeCursor(angle=90, movable=True, label_text="B", pen=pg.mkPen('#00ffcc', width=1.5, style=Qt.PenStyle.SolidLine))
+        self.plot_widget.addItem(self.meas_line_A, ignoreBounds=True)
+        self.plot_widget.addItem(self.meas_line_B, ignoreBounds=True)
+        self.meas_line_A.sigPositionChanged.connect(self.on_meas_line_A_dragged)
+        self.meas_line_B.sigPositionChanged.connect(self.on_meas_line_B_dragged)
+        self.plot_widget.plotItem.vb.sigXRangeChanged.connect(self.sync_cursors_to_screen)
+        self.plot_widget.plotItem.vb.sigRangeChangedManually.connect(self.on_view_manually_changed)
+        self.meas_hud_label = QLabel(self.plot_widget)
+        self.meas_hud_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.meas_hud_label.setStyleSheet("background-color: rgba(25, 25, 25, 220); border: 1px solid #ffcc00; font-size: 11px; padding: 6px; font-family: 'Consolas'; border-radius: 4px;")
+        self.meas_hud_label.hide()
+
+        if self.is_meas_active:
+            self.meas_line_A.setVisible(True)
+            self.meas_line_B.setVisible(True)
+            self.meas_hud_label.show()
+        else:
+            self.meas_line_A.setVisible(False)
+            self.meas_line_B.setVisible(False)
+            self.meas_hud_label.hide()
+
+        if rebuild_plot_items:
+            self.update_curves_style(force=True)
+
+    def _add_time_subwindow(self, title="时域波形", maximized=False):
+        widget = self.create_time_widget()
+        sub = SnapMdiSubWindow()
+        sub.setWidget(widget)
+        sub.setWindowTitle(title)
+        sub.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        sub.setProperty('window_type', 'time')
+        self.mdi_area.addSubWindow(sub)
+        sub.showMaximized() if maximized else sub.show()
+        return sub, widget
+
+    def _ensure_main_time_window(self):
+        try:
+            if self._is_qt_alive(getattr(self, 'plot_widget', None)) and self._is_qt_alive(getattr(self, 'spin_interval', None)):
+                return True
+        except (AttributeError, RuntimeError):
+            pass
+
+        for sub in self.mdi_area.subWindowList():
+            try:
+                if sub.property('window_type') == 'time':
+                    widget = sub.widget()
+                    if widget is not None and hasattr(widget, 'plot_widget'):
+                        self._set_main_time_window(sub, widget, rebuild_plot_items=True)
+                        return True
+            except RuntimeError:
+                continue
+
+        sub, widget = self._add_time_subwindow()
+        self._set_main_time_window(sub, widget, rebuild_plot_items=True)
+        return True
+
     def create_fft_widget(self):
         """创建频域频谱内容（QWidget）"""
         fft_plot = pg.PlotWidget()
@@ -2293,10 +2431,13 @@ class MainWindow(QMainWindow):
                 self.port_combo.setCurrentText(current_selection)
 
     def update_stats_only(self):
+        if getattr(self, '_closing', False):
+            return
         self.current_fps = float(self.total_frames_received - self.last_stat_frames)
         self.current_kbps = float(self.total_bytes_received - self.last_stat_bytes) / 1024.0
         self.last_stat_frames = self.total_frames_received
         self.last_stat_bytes = self.total_bytes_received
+        self._safe_sync_interval_display()
 
     def _reset_dynamic_time_axis(self, keep_time=True):
         """重置动态平均间隔估计器，不清除已有波形数据。"""
@@ -2312,32 +2453,60 @@ class MainWindow(QMainWindow):
 
     def _make_dynamic_time_array(self, frames):
         """按最近 N 秒平均 FPS 生成等间隔时间轴，避免批量接收造成真实时间戳抖动。"""
+        try:
+            frames = int(frames)
+        except (TypeError, ValueError):
+            frames = 0
         if frames <= 0:
             return np.array([], dtype=np.float64)
 
-        now_ms = time.perf_counter() * 1000.0
-        window_ms = max(0.2, float(self.dynamic_time_window_s)) * 1000.0
-        self.dynamic_time_samples.append((now_ms, self.total_frames_received))
-        while len(self.dynamic_time_samples) > 2 and now_ms - self.dynamic_time_samples[0][0] > window_ms:
-            self.dynamic_time_samples.popleft()
+        try:
+            now_ms = time.perf_counter() * 1000.0
+            window_s = float(getattr(self, 'dynamic_time_window_s', 3.0))
+            if not np.isfinite(window_s):
+                window_s = 3.0
+            window_ms = max(0.2, window_s) * 1000.0
 
-        if len(self.dynamic_time_samples) >= 2:
-            first_t, first_frames = self.dynamic_time_samples[0]
-            last_t, last_frames = self.dynamic_time_samples[-1]
-            elapsed_ms = last_t - first_t
-            frame_delta = last_frames - first_frames
-            if elapsed_ms > 1.0 and frame_delta > 0:
-                self.dynamic_fps = frame_delta * 1000.0 / elapsed_ms
-                self.dynamic_interval_ms = max(0.001, 1000.0 / self.dynamic_fps)
+            samples = getattr(self, 'dynamic_time_samples', None)
+            if samples is None:
+                self.dynamic_time_samples = deque()
+                samples = self.dynamic_time_samples
+            samples.append((now_ms, int(getattr(self, 'total_frames_received', 0))))
+            while len(samples) > 2 and now_ms - samples[0][0] > window_ms:
+                samples.popleft()
 
-        if self.dynamic_last_time_ms is None:
-            self._reset_dynamic_time_axis(keep_time=True)
+            if len(samples) >= 2:
+                first_t, first_frames = samples[0]
+                last_t, last_frames = samples[-1]
+                elapsed_ms = float(last_t - first_t)
+                frame_delta = int(last_frames - first_frames)
+                if elapsed_ms > 1.0 and frame_delta > 0:
+                    self.dynamic_fps = frame_delta * 1000.0 / elapsed_ms
+                    self.dynamic_interval_ms = max(0.001, 1000.0 / self.dynamic_fps)
+        except Exception:
+            pass
 
-        step = self.dynamic_interval_ms
-        t_array = self.dynamic_last_time_ms + step * np.arange(1, frames + 1, dtype=np.float64)
-        self.dynamic_last_time_ms = float(t_array[-1])
-        if hasattr(self, 'combo_x_axis') and self.combo_x_axis.currentIndex() == 0:
-            self._sync_interval_spinbox_to_mode()
+        step = float(getattr(self, 'dynamic_interval_ms', 1.0) or 1.0)
+        if not np.isfinite(step) or step <= 0:
+            step = 1.0
+            self.dynamic_interval_ms = step
+
+        last = getattr(self, 'dynamic_last_time_ms', None)
+        if last is None:
+            try:
+                self._reset_dynamic_time_axis(keep_time=True)
+                last = getattr(self, 'dynamic_last_time_ms', 0.0)
+            except Exception:
+                last = 0.0
+        try:
+            last = float(last)
+        except (TypeError, ValueError):
+            last = 0.0
+        if not np.isfinite(last):
+            last = 0.0
+
+        t_array = last + step * np.arange(1, frames + 1, dtype=np.float64)
+        self.dynamic_last_time_ms = float(t_array[-1]) if len(t_array) else last
         return t_array
 
     def send_tx_data(self):
@@ -2381,8 +2550,8 @@ class MainWindow(QMainWindow):
         if not self.data_history or self.data_history[0].total_count < 2:
             return
 
-        interval = self.spin_interval.value()
-        use_real_time = (self.combo_x_axis.currentIndex() == 0)
+        interval = self._get_interval_ms()
+        use_real_time = (self._is_dynamic_x_axis())
 
         if use_real_time:
             live_len = self.data_history[0].total_count
@@ -2558,8 +2727,8 @@ class MainWindow(QMainWindow):
         if self.data_history and self.data_history[0].total_count > 0:
             current_len = self.paused_length if self.is_display_paused else self.data_history[0].total_count
             earliest_abs = max(0, current_len - self.max_memory_points)
-            use_real_time = (self.combo_x_axis.currentIndex() == 0)
-            interval = self.spin_interval.value()
+            use_real_time = (self._is_dynamic_x_axis())
+            interval = self._get_interval_ms()
             prec = self.spin_precision.value()
             
             def get_idx_at_x(target_x):
@@ -2688,11 +2857,11 @@ class MainWindow(QMainWindow):
     def on_view_manually_changed(self, *args):
         if getattr(self, '_setting_range', False): return
         if not self.data_history: return
-        interval = self.spin_interval.value()
+        interval = self._get_interval_ms()
         view_range = self.plot_widget.plotItem.vb.viewRange()
         current_len = self.data_history[0].total_count
         earliest_abs = max(0, current_len - self.max_memory_points)
-        use_real_time = (self.combo_x_axis.currentIndex() == 0)
+        use_real_time = (self._is_dynamic_x_axis())
         
         if getattr(self.vofa_timeline, 'drag_mode', None) is not None: return
         
@@ -2730,7 +2899,7 @@ class MainWindow(QMainWindow):
 
     def on_timeline_range_changed(self, new_start, new_width):
         current_len = self.data_history[0].total_count if self.data_history else 0
-        use_real_time = (self.combo_x_axis.currentIndex() == 0)
+        use_real_time = (self._is_dynamic_x_axis())
         
         if self.vofa_timeline.drag_mode == 'red_dot':
             self.visible_points = new_width
@@ -2750,7 +2919,7 @@ class MainWindow(QMainWindow):
         self.spin_visible_points.setValue(self.visible_points)
         self.spin_visible_points.blockSignals(False)
         
-        interval = self.spin_interval.value()
+        interval = self._get_interval_ms()
         self._setting_range = True
         if self.auto_follow_x:
             end_abs = current_len
@@ -2779,18 +2948,72 @@ class MainWindow(QMainWindow):
         self.dynamic_interval_ms = max(0.001, self.dynamic_interval_ms)
 
     def on_x_axis_mode_changed(self, _idx):
-        self._sync_interval_spinbox_to_mode()
-        self.force_go_latest()
+        try:
+            self.x_axis_mode = int(_idx)
+        except (TypeError, ValueError):
+            self.x_axis_mode = 0
+        self._safe_sync_interval_display()
+        try:
+            self.force_go_latest()
+        except Exception:
+            self.auto_follow_x = True
+
+    def _safe_sync_interval_display(self):
+        try:
+            self._sync_interval_spinbox_to_mode()
+        except BaseException:
+            self._updating_interval_display = False
+            try:
+                self.spin_interval = None
+            except Exception:
+                pass
+
+    def _is_dynamic_x_axis(self):
+        try:
+            return int(getattr(self, 'x_axis_mode', 0)) == 0
+        except (TypeError, ValueError):
+            self.x_axis_mode = 0
+            return True
+
+    def _is_qt_alive(self, obj):
+        if obj is None:
+            return False
+        try:
+            return not sip.isdeleted(obj)
+        except Exception:
+            try:
+                obj.objectName()
+                return True
+            except Exception:
+                return False
+
+    def _get_interval_ms(self):
+        spin = getattr(self, 'spin_interval', None)
+        if self._is_qt_alive(spin):
+            try:
+                return max(0.001, float(spin.value()))
+            except Exception:
+                pass
+        self.spin_interval = None
+        return max(0.001, float(getattr(self, 'configured_interval_ms', 1.0) or 1.0))
 
     def _sync_interval_spinbox_to_mode(self):
-        if not hasattr(self, 'spin_interval'):
-            return
-        use_dynamic = (self.combo_x_axis.currentIndex() == 0)
-        display_value = self.dynamic_interval_ms if use_dynamic else self.configured_interval_ms
-        self._updating_interval_display = True
-        self.spin_interval.setEnabled(not use_dynamic)
-        self.spin_interval.setValue(max(0.001, float(display_value)))
-        self._updating_interval_display = False
+        try:
+            if getattr(self, '_closing', False) or getattr(self, '_loading_config', False):
+                return
+            use_dynamic = (int(getattr(self, 'x_axis_mode', 0)) == 0)
+            display_value = self.dynamic_interval_ms if use_dynamic else self.configured_interval_ms
+            display_value = float(display_value)
+            if not np.isfinite(display_value):
+                display_value = 1.0
+            if use_dynamic:
+                self.dynamic_interval_ms = max(0.001, display_value)
+            else:
+                self.configured_interval_ms = max(0.001, display_value)
+        except BaseException:
+            pass
+        finally:
+            self._updating_interval_display = False
 
     def on_dynamic_time_window_changed(self, value):
         self.dynamic_time_window_s = float(value)
@@ -2799,8 +3022,8 @@ class MainWindow(QMainWindow):
     def on_visible_points_changed(self, value):
         self.visible_points = value
         if not self.auto_follow_x:
-            interval = self.spin_interval.value()
-            use_real_time = (self.combo_x_axis.currentIndex() == 0)
+            interval = self._get_interval_ms()
+            use_real_time = (self._is_dynamic_x_axis())
             self._setting_range = True
             if use_real_time:
                 end_abs = min(self.time_history.total_count, self.view_start_abs + self.visible_points)
@@ -2822,23 +3045,53 @@ class MainWindow(QMainWindow):
         
         for i, curve in enumerate(self.curves):
             if i >= len(self.channel_colors): break
+            if not self._is_qt_alive(curve):
+                continue
             color = self.channel_colors[i]
             pen = pg.mkPen(color=color, width=width)
-            
-            if mode == 0 or mode == 1:  
-                curve.setPen(pen)
-                curve.setSymbol(None)
-            elif mode == 2: 
-                if show_symbols:
-                    curve.setPen(None); curve.setSymbol('o'); curve.setSymbolSize(max(3, width * 2 + 1)); curve.setSymbolBrush(color); curve.setSymbolPen(None)
-                else:
-                    curve.setPen(pen); curve.setSymbol(None)
-            elif mode == 3:  
-                curve.setPen(pen)
-                if show_symbols:
-                    curve.setSymbol('o'); curve.setSymbolSize(max(3, width * 2 + 1)); curve.setSymbolBrush(color); curve.setSymbolPen(None)
-                else:
+            try:
+                if mode == 0 or mode == 1:
+                    curve.setPen(pen)
                     curve.setSymbol(None)
+                elif mode == 2:
+                    if show_symbols:
+                        curve.setPen(None); curve.setSymbol('o'); curve.setSymbolSize(max(3, width * 2 + 1)); curve.setSymbolBrush(color); curve.setSymbolPen(None)
+                    else:
+                        curve.setPen(pen); curve.setSymbol(None)
+                elif mode == 3:
+                    curve.setPen(pen)
+                    if show_symbols:
+                        curve.setSymbol('o'); curve.setSymbolSize(max(3, width * 2 + 1)); curve.setSymbolBrush(color); curve.setSymbolPen(None)
+                    else:
+                        curve.setSymbol(None)
+            except RuntimeError:
+                continue
+
+    def _safe_set_plot_item_visible(self, item, visible):
+        if item is None or not self._is_qt_alive(item):
+            return
+        try:
+            item.setVisible(bool(visible))
+        except RuntimeError:
+            pass
+
+    def _set_channel_visible(self, ch_idx, checked):
+        if 0 <= ch_idx < len(self.curves):
+            self._safe_set_plot_item_visible(self.curves[ch_idx], checked)
+        if 0 <= ch_idx < len(self.fft_curves):
+            self._safe_set_plot_item_visible(self.fft_curves[ch_idx], checked)
+        for sub in self.mdi_area.subWindowList():
+            try:
+                if sub.property('window_type') == 'time':
+                    w = sub.widget()
+                    if hasattr(w, 'curves') and 0 <= ch_idx < len(w.curves):
+                        self._safe_set_plot_item_visible(w.curves[ch_idx], checked)
+                elif sub.property('window_type') == 'fft':
+                    w = sub.widget()
+                    if hasattr(w, 'fft_curves') and 0 <= ch_idx < len(w.fft_curves):
+                        self._safe_set_plot_item_visible(w.fft_curves[ch_idx], checked)
+            except RuntimeError:
+                continue
 
     def mouse_moved(self, evt):
         self.last_mouse_pos = evt
@@ -2939,7 +3192,7 @@ class MainWindow(QMainWindow):
         adjust_layout_by_text() 
         self.channel_layout.addLayout(grid)
         
-        cb.toggled.connect(lambda checked, c=curve, fc=fft_curve: [c.setVisible(checked), fc.setVisible(checked) if fc is not None else None])
+        cb.toggled.connect(lambda checked, idx=ch_idx: self._set_channel_visible(idx, checked))
         color_btn.clicked.connect(lambda checked, idx=ch_idx: self.open_color_picker(idx))
         
         self.channel_widgets.append({"checkbox": cb, "name_edit": name_edit, "color_btn": color_btn, "label": val_label})
@@ -2955,19 +3208,34 @@ class MainWindow(QMainWindow):
         if ch_idx < len(self.channel_colors): 
             self.channel_colors[ch_idx] = hex_color
         self.update_curves_style(force=True)
-        if ch_idx < len(self.fft_curves) and self.fft_curves[ch_idx] is not None:
-            self.fft_curves[ch_idx].setPen(pg.mkPen(color=hex_color, width=max(1, self.spin_linewidth.value())))
-        self.channel_widgets[ch_idx]["color_btn"].setStyleSheet(f"background-color: {hex_color}; border: 1px solid #ffffff;")
-        self.channel_widgets[ch_idx]["label"].setStyleSheet(f"color: {hex_color}; font-weight: bold;")
-        self.hud_labels[ch_idx].color_hex = hex_color
+        if ch_idx < len(self.fft_curves) and self._is_qt_alive(self.fft_curves[ch_idx]):
+            try:
+                self.fft_curves[ch_idx].setPen(pg.mkPen(color=hex_color, width=max(1, self.spin_linewidth.value())))
+            except RuntimeError:
+                pass
+        try:
+            self.channel_widgets[ch_idx]["color_btn"].setStyleSheet(f"background-color: {hex_color}; border: 1px solid #ffffff;")
+            self.channel_widgets[ch_idx]["label"].setStyleSheet(f"color: {hex_color}; font-weight: bold;")
+        except (IndexError, KeyError, RuntimeError):
+            pass
+        if ch_idx < len(self.hud_labels) and self._is_qt_alive(self.hud_labels[ch_idx]):
+            self.hud_labels[ch_idx].color_hex = hex_color
         # 同步颜色到所有 FFT 窗口的十字光标标签
         for sub in self.mdi_area.subWindowList():
-            if sub.property('window_type') == 'fft':
-                w = sub.widget()
-                if hasattr(w, 'fft_channel_labels') and ch_idx < len(w.fft_channel_labels):
-                    w.fft_channel_labels[ch_idx].color_hex = hex_color
+            try:
+                if sub.property('window_type') == 'fft':
+                    w = sub.widget()
+                    if hasattr(w, 'fft_channel_labels') and ch_idx < len(w.fft_channel_labels) and self._is_qt_alive(w.fft_channel_labels[ch_idx]):
+                        w.fft_channel_labels[ch_idx].color_hex = hex_color
+            except RuntimeError:
+                continue
 
     def handle_batch_matrix(self, matrix, t_array):
+        if getattr(self, '_closing', False):
+            return
+        if not self._ensure_main_time_window():
+            return
+
         num_signals = matrix.shape[0]
         frames = matrix.shape[1]
         self.total_frames_received += frames
@@ -2977,33 +3245,52 @@ class MainWindow(QMainWindow):
         while len(self.data_history) > num_signals:
             self.data_history.pop() # 移除数据缓存
             # 从时域图表中移除曲线
-            curve = self.curves.pop()
-            self.plot_widget.removeItem(curve)
+            if self.curves:
+                curve = self.curves.pop()
+                try:
+                    self.plot_widget.removeItem(curve)
+                except RuntimeError:
+                    pass
             # 从频域图表中移除 FFT 曲线
-            fft_curve = self.fft_curves.pop()
-            if fft_curve is not None:
-                self.fft_plot.removeItem(fft_curve)
+            fft_curve = self.fft_curves.pop() if self.fft_curves else None
+            if fft_curve is not None and self.fft_plot is not None:
+                try:
+                    self.fft_plot.removeItem(fft_curve)
+                except RuntimeError:
+                    pass
             # 移除悬浮标签
-            lbl = self.hud_labels.pop()
-            self.plot_widget.removeItem(lbl)
+            if self.hud_labels:
+                lbl = self.hud_labels.pop()
+                try:
+                    self.plot_widget.removeItem(lbl)
+                except RuntimeError:
+                    pass
             # 移除所有 FFT 窗口的十字光标标签和 mag 缓存
             for sub in self.mdi_area.subWindowList():
-                if sub.property('window_type') == 'fft':
-                    w = sub.widget()
-                    if hasattr(w, 'fft_channel_labels') and w.fft_channel_labels:
-                        fft_lbl = w.fft_channel_labels.pop()
-                        if hasattr(w, 'fft_plot'):
-                            w.fft_plot.removeItem(fft_lbl)
-                    if hasattr(w, 'fft_mags'):
-                        stale = [k for k in w.fft_mags if k >= len(self.data_history)]
-                        for k in stale:
-                            del w.fft_mags[k]
+                try:
+                    if sub.property('window_type') == 'fft':
+                        w = sub.widget()
+                        if hasattr(w, 'fft_channel_labels') and w.fft_channel_labels:
+                            fft_lbl = w.fft_channel_labels.pop()
+                            if hasattr(w, 'fft_plot'):
+                                try:
+                                    w.fft_plot.removeItem(fft_lbl)
+                                except RuntimeError:
+                                    pass
+                        if hasattr(w, 'fft_mags'):
+                            stale = [k for k in w.fft_mags if k >= len(self.data_history)]
+                            for k in stale:
+                                del w.fft_mags[k]
+                except RuntimeError:
+                    continue
             # 销毁左侧面板的 UI 控件
-            widgets = self.channel_widgets.pop()
-            widgets["checkbox"].deleteLater()
-            widgets["name_edit"].deleteLater()
-            widgets["color_btn"].deleteLater()
-            widgets["label"].deleteLater()
+            widgets = self.channel_widgets.pop() if self.channel_widgets else {}
+            for key in ("checkbox", "name_edit", "color_btn", "label"):
+                try:
+                    if key in widgets:
+                        widgets[key].deleteLater()
+                except RuntimeError:
+                    pass
 
         # 当接收到的通道数增加时，创建新通道
         while len(self.data_history) < num_signals:
@@ -3014,14 +3301,26 @@ class MainWindow(QMainWindow):
         if len(self.data_history) != old_num_channels:
             self._refresh_all_imu_channels()
 
-        self.time_history.extend(self._make_dynamic_time_array(frames))
+        try:
+            time_array = self._make_dynamic_time_array(frames)
+        except Exception:
+            step = max(0.001, float(getattr(self, 'dynamic_interval_ms', 1.0)))
+            last = float(getattr(self, 'dynamic_last_time_ms', 0.0) or 0.0)
+            time_array = last + step * np.arange(1, frames + 1, dtype=np.float64)
+            self.dynamic_last_time_ms = float(time_array[-1]) if len(time_array) else last
+        self.time_history.extend(time_array)
         for i in range(num_signals): 
             self.data_history[i].extend(matrix[i])
 
     def force_go_latest(self):
         self.auto_follow_x = True
-        self.btn_go_latest.setText("拉到最新")
-        self.btn_go_latest.setStyleSheet("background-color: #28a745; min-width: 80px;")
+        try:
+            btn = getattr(self, 'btn_go_latest', None)
+            if btn is not None:
+                btn.setText("拉到最新")
+                btn.setStyleSheet("background-color: #28a745; min-width: 80px;")
+        except RuntimeError:
+            self.btn_go_latest = None
                     
     def update_time_plot(self, plot_widget, curves_list, chunk_start, chunk_end, x_data_full, is_stacked, mode, is_text_frame, enable_hud=False):
         """更新时域波形图，指定 plot_widget 和曲线列表"""
@@ -3091,11 +3390,11 @@ class MainWindow(QMainWindow):
                             if shared_x_step is None or len(shared_x_step) != len(x_data_full) * 2:
                                 shared_x_step = np.empty(2 * len(x_data_full), dtype=x_data_full.dtype)
                                 shared_x_step[0::2] = x_data_full
-                                if self.combo_x_axis.currentIndex() == 0:
-                                    dt = (x_data_full[-1] - x_data_full[0]) / (len(x_data_full)-1) if len(x_data_full) > 1 else self.spin_interval.value()
+                                if self._is_dynamic_x_axis():
+                                    dt = (x_data_full[-1] - x_data_full[0]) / (len(x_data_full)-1) if len(x_data_full) > 1 else self._get_interval_ms()
                                     shared_x_step[1::2] = np.append(x_data_full[1:], x_data_full[-1] + dt)
                                 else:
-                                    interval = self.spin_interval.value()
+                                    interval = self._get_interval_ms()
                                     shared_x_step[1::2] = (np.arange(chunk_start + 1, chunk_end + 1, dtype=np.float32)) * interval
                             y_step = np.empty(2 * len(y_draw), dtype=np.float32)
                             y_step[0::2] = y_draw
@@ -3347,6 +3646,8 @@ class MainWindow(QMainWindow):
             widget.imu_angle_label.adjustSize()
 
     def update_plot_display(self):
+        if getattr(self, '_closing', False):
+            return
         if not self.data_history:
             return
         if getattr(self, '_resizing', False):
@@ -3358,7 +3659,7 @@ class MainWindow(QMainWindow):
         else:
             current_len = live_len
 
-        if self.combo_x_axis.currentIndex() == 0:
+        if self._is_dynamic_x_axis():
             x_axis_info = f"动态: {self.dynamic_fps:.1f} Hz / {self.dynamic_interval_ms:.3f} ms"
         else:
             x_axis_info = f"间隔: {self.configured_interval_ms:.3f} ms"
@@ -3379,8 +3680,8 @@ class MainWindow(QMainWindow):
                         self.channel_widgets[i]["label"].setText(f"{last_val:>.{prec}f}")
 
         earliest_abs = max(0, current_len - self.max_memory_points)
-        interval = self.spin_interval.value()
-        use_real_time = (self.combo_x_axis.currentIndex() == 0)
+        interval = self._get_interval_ms()
+        use_real_time = (self._is_dynamic_x_axis())
         is_stacked = self.cb_stacked_mode.isChecked()
 
         # 设置视图边界（仅主窗口）
@@ -3513,9 +3814,9 @@ class MainWindow(QMainWindow):
         if self.last_mouse_pos is not None and self.plot_widget.sceneBoundingRect().contains(self.last_mouse_pos):
             mouse_point = self.plot_widget.plotItem.vb.mapSceneToView(self.last_mouse_pos)
             x_val = mouse_point.x()
-            interval = self.spin_interval.value()
+            interval = self._get_interval_ms()
             prec = self.spin_precision.value()
-            use_real_time = (self.combo_x_axis.currentIndex() == 0)
+            use_real_time = (self._is_dynamic_x_axis())
             is_stacked = self.cb_stacked_mode.isChecked()
 
             if len(self.data_history) > 0:
@@ -3777,11 +4078,21 @@ class MainWindow(QMainWindow):
     def clear_data(self):
         for i in range(len(self.data_history)):
             self.data_history[i].clear()
-            self.curves[i].setData([], [])
-            if i < len(self.channel_widgets): 
-                self.channel_widgets[i]["label"].setText("0.00")
-            if i < len(self.fft_curves) and self.fft_curves[i] is not None:
-                self.fft_curves[i].setData([], [])
+            if i < len(self.curves) and self._is_qt_alive(self.curves[i]):
+                try:
+                    self.curves[i].setData([], [])
+                except RuntimeError:
+                    pass
+            if i < len(self.channel_widgets):
+                try:
+                    self.channel_widgets[i]["label"].setText("0.00")
+                except RuntimeError:
+                    pass
+            if i < len(self.fft_curves) and self._is_qt_alive(self.fft_curves[i]):
+                try:
+                    self.fft_curves[i].setData([], [])
+                except RuntimeError:
+                    pass
         self.time_history.clear()
         self._reset_dynamic_time_axis(keep_time=False)
         for lbl in self.hud_labels:
@@ -3807,7 +4118,7 @@ class MainWindow(QMainWindow):
             earliest_abs = max(0, current_len - self.max_memory_points)
             total_points = current_len - earliest_abs
             num_channels = len(self.data_history)
-            use_real_time = (self.combo_x_axis.currentIndex() == 0)
+            use_real_time = (self._is_dynamic_x_axis())
             
             all_y_data = []
             for i in range(num_channels):
@@ -3821,7 +4132,7 @@ class MainWindow(QMainWindow):
                     time_data = self.time_history.get_data_slice(earliest_abs, current_len)
                 else:
                     headers = ["Sample_Index"] + [self.channel_widgets[i]["name_edit"].text().strip() or f"CH_{i+1}" for i in range(num_channels)]
-                    time_data = np.arange(earliest_abs, current_len) * self.spin_interval.value()
+                    time_data = np.arange(earliest_abs, current_len) * self._get_interval_ms()
 
                 writer.writerow(headers)
                 for idx in range(total_points):
@@ -3859,8 +4170,12 @@ class MainWindow(QMainWindow):
                     for ch_idx in range(num_channels):
                         matrix[ch_idx, row_idx] = float(row[ch_idx + 1])
                 
-                if headers[0] == "Time_ms": self.combo_x_axis.setCurrentIndex(0)
-                else: self.combo_x_axis.setCurrentIndex(1)
+                if headers[0] == "Time_ms":
+                    self.x_axis_mode = 0
+                    self.combo_x_axis.setCurrentIndex(0)
+                else:
+                    self.x_axis_mode = 1
+                    self.combo_x_axis.setCurrentIndex(1)
                 
                 while len(self.data_history) < num_channels:
                     self.data_history.append(CircularBuffer(self.max_memory_points))
@@ -3878,8 +4193,8 @@ class MainWindow(QMainWindow):
             self.btn_go_latest.setStyleSheet("background-color: #555555; min-width: 80px;")
             self.view_start_abs = 0
             
-            interval = self.spin_interval.value()
-            use_real_time = (self.combo_x_axis.currentIndex() == 0)
+            interval = self._get_interval_ms()
+            use_real_time = (self._is_dynamic_x_axis())
             
             if use_real_time: self.plot_widget.setXRange(time_array[0], time_array[min(total_points - 1, self.visible_points)], padding=0)
             else: self.plot_widget.setXRange(0, min(total_points, self.visible_points) * interval, padding=0)
@@ -3889,10 +4204,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "导入错误", f"加载失败: {e}")
 
     def load_saved_configurations(self):
+        self._loading_config = True
         try:
             # 加载通用设置
             if self.settings.contains("x_axis_mode"):
-                self.combo_x_axis.setCurrentIndex(int(self.settings.value("x_axis_mode")))
+                self.x_axis_mode = int(self.settings.value("x_axis_mode"))
+                self.combo_x_axis.setCurrentIndex(self.x_axis_mode)
             if self.settings.contains("dynamic_time_window"):
                 self.spin_dynamic_time_window.setValue(float(self.settings.value("dynamic_time_window")))
             if self.settings.contains("draw_mode"):
@@ -3905,12 +4222,12 @@ class MainWindow(QMainWindow):
                 self.spin_linewidth.setValue(float(self.settings.value("linewidth")))
             if self.settings.contains("interval"):
                 self.configured_interval_ms = float(self.settings.value("interval"))
-                self._updating_interval_display = True
-                self.spin_interval.setValue(self.configured_interval_ms)
-                self._updating_interval_display = False
             else:
-                self.configured_interval_ms = self.spin_interval.value()
-            self._sync_interval_spinbox_to_mode()
+                try:
+                    self.configured_interval_ms = self._get_interval_ms()
+                except (AttributeError, RuntimeError):
+                    self.configured_interval_ms = 1.0
+            self._safe_sync_interval_display()
             if self.settings.contains("max_cache"):
                 self.spin_max_cache.setValue(int(self.settings.value("max_cache")))
                 self.max_memory_points = int(self.settings.value("max_cache"))
@@ -3952,6 +4269,12 @@ class MainWindow(QMainWindow):
                     self.main_fft_sub = None
                     self.fft_plot = None
                     self.fft_hud_label = None
+                    for attr in ('plot_widget', 'vofa_timeline', 'spin_max_cache',
+                                 'spin_interval', 'spin_visible_points',
+                                 'lbl_buffer_status', 'btn_go_latest', 'time_hud_label'):
+                        setattr(self, attr, None)
+                    self.curves = []
+                    self.hud_labels = []
 
                     # 重建保存的窗口
                     for win_data in window_list:
@@ -4015,43 +4338,18 @@ class MainWindow(QMainWindow):
                     print(f"[加载配置] 已加载 {len(window_list)} 个窗口")
 
                     # 重建完成后，更新主时域窗口引用（第一个时域窗口）
+                    main_time_found = False
                     for sub in self.mdi_area.subWindowList():
                         if sub.property('window_type') == 'time':
                             widget = sub.widget()
                             if hasattr(widget, 'plot_widget'):
-                                self.plot_widget = widget.plot_widget
-                                self.main_time_sub = sub
-                                self.vofa_timeline = widget.vofa_timeline
-                                self.spin_max_cache = widget.spin_max_cache
-                                self.spin_interval = widget.spin_interval
-                                self.spin_visible_points = widget.spin_visible_points
-                                self.lbl_buffer_status = widget.lbl_buffer_status
-                                self.btn_go_latest = widget.btn_go_latest
-                                self.time_hud_label = widget.time_hud_label
-
-                                # 重新添加测量线（因为新建了 plot_widget）
-                                self.meas_line_A = OscilloscopeCursor(angle=90, movable=True, label_text="A", pen=pg.mkPen('#ffcc00', width=1.5, style=Qt.PenStyle.SolidLine))
-                                self.meas_line_B = OscilloscopeCursor(angle=90, movable=True, label_text="B", pen=pg.mkPen('#00ffcc', width=1.5, style=Qt.PenStyle.SolidLine))
-                                self.plot_widget.addItem(self.meas_line_A, ignoreBounds=True)
-                                self.plot_widget.addItem(self.meas_line_B, ignoreBounds=True)
-                                self.meas_line_A.sigPositionChanged.connect(self.on_meas_line_A_dragged)
-                                self.meas_line_B.sigPositionChanged.connect(self.on_meas_line_B_dragged)
-                                self.plot_widget.plotItem.vb.sigXRangeChanged.connect(self.sync_cursors_to_screen)
-                                self.plot_widget.plotItem.vb.sigRangeChangedManually.connect(self.on_view_manually_changed)
-                                self.meas_hud_label = QLabel(self.plot_widget)
-                                self.meas_hud_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-                                self.meas_hud_label.setStyleSheet("background-color: rgba(25, 25, 25, 220); border: 1px solid #ffcc00; font-size: 11px; padding: 6px; font-family: 'Consolas'; border-radius: 4px;")
-                                self.meas_hud_label.hide()
-                                # 根据测量状态显示
-                                if self.is_meas_active:
-                                    self.meas_line_A.setVisible(True)
-                                    self.meas_line_B.setVisible(True)
-                                    self.meas_hud_label.show()
-                                else:
-                                    self.meas_line_A.setVisible(False)
-                                    self.meas_line_B.setVisible(False)
-                                    self.meas_hud_label.hide()
+                                self._set_main_time_window(sub, widget, rebuild_plot_items=True)
+                                main_time_found = True
                                 break  # 只处理第一个时域窗口
+                    if not main_time_found:
+                        sub, widget = self._add_time_subwindow()
+                        self._set_main_time_window(sub, widget, rebuild_plot_items=True)
+                        print("[加载配置] 未找到时域窗口，已自动创建一个主时域窗口")
 
                     # 更新频域引用（如果有多个，取第一个）
                     for sub in self.mdi_area.subWindowList():
@@ -4066,8 +4364,12 @@ class MainWindow(QMainWindow):
             print(f"加载配置时出错: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            self._loading_config = False
+            self._safe_sync_interval_display()
 
     def closeEvent(self, event):
+        self._closing = True
         if self.comm_thread:
             self.comm_thread.stop()
         self.plot_timer.stop()
